@@ -186,6 +186,62 @@ def test_model_boxes_are_source_model(client, mov, s3):
     assert client.get(f"/api/v1/queue/jobs/{job_id}").json()["detector"] == "rfdetr"
 
 
+def test_events_list_type_ids_and_manual_events(client, mov, s3):
+    job_id = upload_api(client, mov).json()["job_id"]
+    video_id = client.get(f"/api/v1/queue/jobs/{job_id}").json()["video_id"]
+    finish_job(s3, job_id, [violation_event(1.0, job_id=job_id),
+                            {"t_start": 0.5, "t_end": 0.5, "event": "person_enter", "status": "expected"}])
+    types = {t["id"]: t for t in client.get("/api/v1/event-types").json()}
+    events = client.get("/api/v1/events").json()
+    assert {e["type_id"] for e in events} <= set(types)  # у каждого события тип из каталога
+    carry = next(e for e in events if e["status"] == "violation")
+    assert types[carry["type_id"]]["title"] == "Деньги предыдущего клиента на кассовом столе"
+    assert types[carry["type_id"]]["kind"] == "violation" and types["step:person_enter"]["kind"] == "expected"
+
+    personal = next(t["id"] for t in types.values() if t["title"] == "Личные вещи на кассовом столе")
+    body = {"video_id": video_id, "type_id": personal, "start": 1.0, "end": 2.0, "description": "сумка на столе"}
+    manual = client.post("/api/v1/events", json=body).json()
+    assert (manual["source"], manual["review"], manual["type_id"], manual["status"]) == ("human", "approved", personal, "violation")
+    assert client.put(f"/api/v1/events/{manual['id']}", json={**body, "end": 3.0}).json()["t_end"] == 3.0
+    assert client.delete(f"/api/v1/events/{carry['id']}").status_code == 409  # событие модели не удаляется
+    assert client.delete(f"/api/v1/events/{manual['id']}").status_code == 204
+    assert all(e["source"] == "model" for e in client.get("/api/v1/events").json())
+
+
+def test_custom_event_type_needs_ten_videos(client, mov, s3):
+    videos = []
+    for _ in range(10):
+        job_id = upload_api(client, mov).json()["job_id"]
+        videos.append(client.get(f"/api/v1/queue/jobs/{job_id}").json()["video_id"])
+    t = client.post("/api/v1/event-types", json={"title": "Кассир ест", "kind": "warning", "description": "еда",
+                                                 "observable": "еда на столе",
+                                                 "first_sample": {"video_id": videos[0], "start": 1, "end": 2}}).json()
+    assert (t["status"], t["custom"], len(t["samples"])) == ("draft", True, 1)
+    again = client.post(f"/api/v1/event-types/{t['id']}/samples", json={"video_id": videos[0], "start": 3, "end": 4})
+    assert again.status_code == 409  # одна запись — один действующий пример
+    for v in videos[1:]:
+        t = client.post(f"/api/v1/event-types/{t['id']}/samples", json={"video_id": v, "start": 1, "end": 2}).json()
+    for sample in t["samples"][:-1]:
+        t = client.post(f"/api/v1/event-types/{t['id']}/samples/{sample['id']}/review", json={"decision": "approved"}).json()
+    assert client.post(f"/api/v1/event-types/{t['id']}/publish").status_code == 409  # 9 из 10
+    last = t["samples"][-1]["id"]
+    client.post(f"/api/v1/event-types/{t['id']}/samples/{last}/review", json={"decision": "approved"})
+    assert client.post(f"/api/v1/event-types/{t['id']}/publish").json()["status"] == "published"
+
+
+def test_pipeline_dataset_rerun_train(client, mov, s3, started):
+    job_id = upload_api(client, mov).json()["job_id"]
+    finish_job(s3, job_id, [], verdict="no_violation")
+    assert client.get("/api/v1/pipeline").json()["batch_stage"] == "idle"
+    ds = client.post("/api/v1/pipeline/dataset").json()
+    assert ds["dataset_stage"] == "ready" and any(k.startswith("datasets/") for k in s3)
+    rerun = client.post("/api/v1/pipeline/rerun").json()
+    assert (rerun["batch_stage"], rerun["total_videos"], rerun["processed_videos"]) == ("running", 1, 0)
+    finish_job(s3, started[-1], [], verdict="no_violation")
+    assert client.get("/api/v1/pipeline").json()["batch_stage"] == "ready"
+    assert client.post("/api/v1/pipeline/train").status_code == 409
+
+
 def test_meta_and_cameras(client):
     assert client.get("/api/v1/cameras").json() == {"items": [], "coming_soon": True}
     meta = client.get("/api/v1/meta").json()

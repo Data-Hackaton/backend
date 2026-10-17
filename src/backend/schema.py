@@ -130,6 +130,68 @@ class EventOut(BaseModel):
     review: Review
     review_comment: str | None
     reviewed_at: datetime | None
+    type_id: str  # id типа из GET /event-types
+    source: Literal["model", "human"] = "model"
+
+
+class ManualEventIn(BaseModel):
+    video_id: str
+    type_id: str
+    start: float = Field(ge=0)
+    end: float = Field(ge=0)
+    description: str = ""
+
+
+EventKind = Literal["violation", "warning", "quality", "expected"]
+
+
+class SampleIn(BaseModel):
+    video_id: str
+    start: float = Field(ge=0)
+    end: float = Field(ge=0)
+
+
+class SampleOut(SampleIn):
+    id: int
+    review: Literal["pending", "approved", "rejected"]
+
+
+class EventTypeIn(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    description: str = ""
+    observable: str = ""
+    kind: EventKind
+    first_sample: SampleIn
+
+
+class EventTypeOut(BaseModel):
+    id: str
+    title: str
+    description: str
+    observable: str
+    kind: EventKind
+    custom: bool
+    status: Literal["published", "draft"]
+    samples: list[SampleOut] = []
+    norm: str | None = None
+
+
+class SampleReviewIn(BaseModel):
+    decision: Literal["approved", "rejected"]
+
+
+PipelineStage = Literal["idle", "running", "ready", "failed"]
+
+
+class PipelineOut(BaseModel):
+    dataset_version: str | None = None
+    dataset_stage: PipelineStage = "idle"
+    model_version: str | None = None
+    training_stage: PipelineStage = "idle"
+    batch_stage: PipelineStage = "idle"
+    processed_videos: int = 0
+    total_videos: int = 0
+    error: str | None = None
 
 
 class ReviewIn(BaseModel):

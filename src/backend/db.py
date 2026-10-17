@@ -83,6 +83,44 @@ class Event(Base):
     review: Mapped[str] = mapped_column(String(16), default="pending", index=True)  # pending / approved / rejected / none
     review_comment: Mapped[str | None] = mapped_column(Text)
     reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(16), default="model", server_default="model")  # model / human
+
+
+class EventType(Base):
+    """Собственный тип события из интерфейса: черновик, пока нет 10 подтверждённых примеров из разных записей."""
+
+    __tablename__ = "event_types"
+    id: Mapped[str] = mapped_column(String(12), primary_key=True)
+    title: Mapped[str] = mapped_column(String(200))
+    description: Mapped[str] = mapped_column(Text, default="")
+    observable: Mapped[str] = mapped_column(Text, default="")
+    kind: Mapped[str] = mapped_column(String(16))  # violation / warning / quality / expected
+    status: Mapped[str] = mapped_column(String(16), default="draft")  # draft / published
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class EventSample(Base):
+    __tablename__ = "event_samples"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    type_id: Mapped[str] = mapped_column(ForeignKey("event_types.id"), index=True)
+    video_id: Mapped[str] = mapped_column(ForeignKey("videos.id"), index=True)
+    start: Mapped[float] = mapped_column(Float)
+    end: Mapped[float] = mapped_column(Float)
+    review: Mapped[str] = mapped_column(String(16), default="pending")  # pending / approved / rejected
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
+
+
+class PipelineRun(Base):
+    """Запуски конвейера из интерфейса: сборка датасета и пересчёт архива."""
+
+    __tablename__ = "pipeline_runs"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    kind: Mapped[str] = mapped_column(String(16))  # dataset / rerun
+    status: Mapped[str] = mapped_column(String(16))  # running / ready / failed
+    version: Mapped[str | None] = mapped_column(String(32))
+    total: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
 class Box(Base):
@@ -112,6 +150,10 @@ SessionLocal = sessionmaker(engine, expire_on_commit=False)
 
 def init_db() -> None:
     Base.metadata.create_all(engine)
+    # колонки, добавленные после первого запуска: create_all их в существующие таблицы не добавляет
+    if engine.dialect.name == "postgresql":
+        with engine.begin() as conn:
+            conn.exec_driver_sql("ALTER TABLE events ADD COLUMN IF NOT EXISTS source VARCHAR(16) NOT NULL DEFAULT 'model'")
 
 
 def get_db() -> Iterator[Session]:

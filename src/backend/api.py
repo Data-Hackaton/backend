@@ -16,12 +16,13 @@ from fastapi.responses import Response, StreamingResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from backend import config, media, progress, storage, temporal_client
+from backend import catalog, config, media, progress, storage, temporal_client
 from backend.auth import hash_token, new_token, require_key
-from backend.db import ApiToken, Box, Event, Job, Video, get_db, now
+from backend.db import ApiToken, Box, Event, EventSample, EventType, Job, PipelineRun, Video, get_db, now
 from backend.schema import (
-    AnalyzeResponse, BoxIn, BoxOut, CalendarDay, EventOut, EvidenceFrame, JobOut, JobResponse, QueueOut, QueueWorker,
-    ReviewIn, Rule, TokenCreated, TokenIn, TokenOut, UploadOut, VideoOut, Violation,
+    AnalyzeResponse, BoxIn, BoxOut, CalendarDay, EventOut, EventTypeIn, EventTypeOut, EvidenceFrame, JobOut,
+    JobResponse, ManualEventIn, PipelineOut, QueueOut, QueueWorker, ReviewIn, Rule, SampleIn, SampleOut,
+    SampleReviewIn, TokenCreated, TokenIn, TokenOut, UploadOut, VideoOut, Violation,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -140,6 +141,8 @@ def event_out(e: Event) -> EventOut:
         title=e.title, rules=e.rules or [], norm=e.norm, message=e.message,
         evidence=[{"t": ev["t"], "url": f"/api/v1/events/{e.id}/evidence/{i}"} for i, ev in enumerate(e.evidence or [])],
         review=e.review, review_comment=e.review_comment, reviewed_at=e.reviewed_at,
+        type_id=catalog.event_type_id(e.event, e.status, e.title, e.rules, e.source or "model"),
+        source=e.source or "model",
     )
 
 
@@ -338,6 +341,87 @@ def video_events(video_id: str, db: Db, status: str | None = None, job_id: str |
     return [event_out(e) for e in db.scalars(q).all()]
 
 
+def latest_done_jobs(db: Session) -> list[str]:
+    """id последнего готового анализа каждого видео."""
+    rows = db.execute(select(Job.video_id, Job.id, Job.finished_at).where(Job.status == "done")).all()
+    best: dict[str, tuple] = {}
+    for video_id, job_id, finished in rows:
+        if video_id not in best or (finished and (best[video_id][1] is None or finished > best[video_id][1])):
+            best[video_id] = (job_id, finished)
+    return [job_id for job_id, _ in best.values()]
+
+
+@router.get("/events", response_model=list[EventOut], tags=["events"])
+def all_events(db: Db, video_id: str | None = None, status: str | None = None) -> list[EventOut]:
+    """События последнего готового анализа по всем видео (или одному) и ручные события — для интерфейса одним запросом."""
+    q = select(Event).where((Event.job_id.in_(latest_done_jobs(db))) | (Event.source == "human"))
+    if video_id:
+        q = q.where(Event.video_id == video_id)
+    if status:
+        q = q.where(Event.status == status)
+    return [event_out(e) for e in db.scalars(q.order_by(Event.video_id, Event.t_start)).all()]
+
+
+def type_by_id(db: Session, type_id: str) -> dict:
+    found = next((t for t in catalog.standard_types() if t["id"] == type_id), None)
+    if found:
+        return found
+    custom = db.get(EventType, type_id.removeprefix("custom:"))
+    if custom is None:
+        raise HTTPException(status_code=404, detail="тип события не найден")
+    return event_type_out(db, custom).model_dump()
+
+
+def apply_manual(e: Event, body: ManualEventIn, db: Session) -> None:
+    t = type_by_id(db, body.type_id)
+    if t["status"] != "published":
+        raise HTTPException(status_code=409, detail="выберите опубликованный тип события")
+    if body.end < body.start:
+        raise HTTPException(status_code=422, detail="конец раньше начала")
+    e.video_id, e.t_start, e.t_end = body.video_id, body.start, body.end
+    e.event, e.status, e.title = "manual", ("expected" if t["kind"] == "quality" else t["kind"]), t["title"]
+    e.rules, e.norm, e.message = [body.type_id], t.get("norm"), body.description or t["description"]
+
+
+@router.post("/events", response_model=EventOut, tags=["events"])
+def create_manual_event(body: ManualEventIn, db: Db) -> EventOut:
+    """Событие, отмеченное человеком: тип из каталога, отрезок записи, описание. Сразу подтверждено."""
+    _video(db, body.video_id)
+    job = last_job(db, body.video_id)
+    if job is None:
+        raise HTTPException(status_code=409, detail="у записи нет анализа")
+    e = Event(job_id=job.id, source="human", review="approved", evidence=[], reviewed_at=now())
+    apply_manual(e, body, db)
+    db.add(e)
+    db.commit()
+    return event_out(e)
+
+
+def _manual(db: Session, event_id: int) -> Event:
+    e = db.get(Event, event_id)
+    if e is None:
+        raise HTTPException(status_code=404, detail="event not found")
+    if e.source != "human":
+        raise HTTPException(status_code=409, detail="менять и удалять можно только события, добавленные человеком")
+    return e
+
+
+@router.put("/events/{event_id}", response_model=EventOut, tags=["events"])
+def update_manual_event(event_id: int, body: ManualEventIn, db: Db) -> EventOut:
+    e = _manual(db, event_id)
+    _video(db, body.video_id)
+    apply_manual(e, body, db)
+    db.commit()
+    return event_out(e)
+
+
+@router.delete("/events/{event_id}", status_code=204, tags=["events"])
+def delete_manual_event(event_id: int, db: Db) -> Response:
+    db.delete(_manual(db, event_id))
+    db.commit()
+    return Response(status_code=204)
+
+
 @router.get("/events/{event_id}/evidence/{n}", tags=["events"], response_class=Response)
 def evidence(event_id: int, n: int, db: Db) -> Response:
     e = db.get(Event, event_id)
@@ -373,13 +457,24 @@ def box_out(b: Box) -> BoxOut:
 
 
 @router.get("/videos/{video_id}/boxes", response_model=list[BoxOut], tags=["boxes"])
-def video_boxes(video_id: str, db: Db, t_from: float = 0.0, t_to: float = 1e9) -> list[BoxOut]:
-    """Боксы на отрезке; если на кадре есть правка человека, боксы модели этого кадра не отдаются."""
+def video_boxes(video_id: str, db: Db, t_from: float = 0.0, t_to: float = 1e9,
+                step: Annotated[float, Query(ge=0)] = 0.0) -> list[BoxOut]:
+    """Боксы на отрезке; если на кадре есть правка человека, боксы модели этого кадра не отдаются.
+    step > 0 — боксы модели только с кадров не чаще чем раз в step секунд (интерфейс опрашивает часто);
+    правки человека отдаются все."""
     _video(db, video_id)
     boxes = db.scalars(select(Box).where(Box.video_id == video_id, Box.deleted.is_(False), Box.t >= t_from,
                                          Box.t <= t_to).order_by(Box.t, Box.id)).all()
     human_frames = {round(b.t, 3) for b in boxes if b.source == "human"}
-    return [box_out(b) for b in boxes if b.source == "human" or round(b.t, 3) not in human_frames]
+    keep_frames: set[float] = set()
+    if step:
+        last = None
+        for t in sorted({round(b.t, 3) for b in boxes if b.source != "human"}):
+            if last is None or t - last >= step - 1e-6:
+                keep_frames.add(t)
+                last = t
+    return [box_out(b) for b in boxes if b.source == "human" or (
+        round(b.t, 3) not in human_frames and (not step or round(b.t, 3) in keep_frames))]
 
 
 @router.put("/videos/{video_id}/boxes", response_model=list[BoxOut], tags=["boxes"])
@@ -453,6 +548,154 @@ def revoke_token(token_id: int, db: Db) -> TokenOut:
     token.revoked_at = token.revoked_at or now()
     db.commit()
     return token_out(token)
+
+
+# --- типы событий: стандартные и собственные ------------------------------------------------------------------------
+
+PUBLISH_MIN_VIDEOS = 10  # собственный тип публикуется после подтверждённых примеров из 10 разных записей
+
+
+def event_type_out(db: Session, t: EventType) -> EventTypeOut:
+    samples = db.scalars(select(EventSample).where(EventSample.type_id == t.id).order_by(EventSample.id)).all()
+    return EventTypeOut(id=f"custom:{t.id}", title=t.title, description=t.description, observable=t.observable,
+                        kind=t.kind, custom=True, status=t.status,
+                        samples=[SampleOut(id=x.id, video_id=x.video_id, start=x.start, end=x.end, review=x.review)
+                                 for x in samples])
+
+
+def _custom(db: Session, type_id: str) -> EventType:
+    t = db.get(EventType, type_id.removeprefix("custom:"))
+    if t is None:
+        raise HTTPException(status_code=404, detail="тип события не найден")
+    return t
+
+
+def _add_sample(db: Session, t: EventType, body: SampleIn) -> None:
+    """Одна запись — не больше одного действующего примера типа; отклонённый можно заменить."""
+    _video(db, body.video_id)
+    if body.end < body.start:
+        raise HTTPException(status_code=422, detail="конец раньше начала")
+    active = db.scalar(select(EventSample).where(EventSample.type_id == t.id, EventSample.video_id == body.video_id,
+                                                 EventSample.review != "rejected"))
+    if active is not None:
+        raise HTTPException(status_code=409, detail="у этой записи уже есть пример этого типа")
+    db.add(EventSample(type_id=t.id, video_id=body.video_id, start=body.start, end=body.end))
+
+
+@router.get("/event-types", response_model=list[EventTypeOut], tags=["event-types"])
+def event_types(db: Db) -> list[EventTypeOut]:
+    custom = db.scalars(select(EventType).order_by(EventType.created_at)).all()
+    return [EventTypeOut(**t) for t in catalog.standard_types()] + [event_type_out(db, t) for t in custom]
+
+
+@router.post("/event-types", response_model=EventTypeOut, tags=["event-types"])
+def create_event_type(body: EventTypeIn, db: Db) -> EventTypeOut:
+    t = EventType(id=uuid.uuid4().hex[:12], title=body.title, description=body.description,
+                  observable=body.observable, kind=body.kind, status="draft")
+    db.add(t)
+    db.flush()
+    _add_sample(db, t, body.first_sample)
+    db.commit()
+    return event_type_out(db, t)
+
+
+@router.post("/event-types/{type_id}/samples", response_model=EventTypeOut, tags=["event-types"])
+def add_sample(type_id: str, body: SampleIn, db: Db) -> EventTypeOut:
+    t = _custom(db, type_id)
+    _add_sample(db, t, body)
+    db.commit()
+    return event_type_out(db, t)
+
+
+@router.post("/event-types/{type_id}/samples/{sample_id}/review", response_model=EventTypeOut, tags=["event-types"])
+def review_sample(type_id: str, sample_id: int, body: SampleReviewIn, db: Db) -> EventTypeOut:
+    t = _custom(db, type_id)
+    sample = db.get(EventSample, sample_id)
+    if sample is None or sample.type_id != t.id:
+        raise HTTPException(status_code=404, detail="пример не найден")
+    sample.review = body.decision
+    db.commit()
+    return event_type_out(db, t)
+
+
+@router.post("/event-types/{type_id}/publish", response_model=EventTypeOut, tags=["event-types"])
+def publish_event_type(type_id: str, db: Db) -> EventTypeOut:
+    t = _custom(db, type_id)
+    videos = set(db.scalars(select(EventSample.video_id).where(EventSample.type_id == t.id,
+                                                               EventSample.review == "approved")).all())
+    if len(videos) < PUBLISH_MIN_VIDEOS:
+        raise HTTPException(status_code=409, detail=f"нужны подтверждённые примеры из {PUBLISH_MIN_VIDEOS} разных "
+                                                    f"записей, сейчас {len(videos)}")
+    t.status = "published"
+    db.commit()
+    return event_type_out(db, t)
+
+
+# --- конвейер: датасет, обучение, пересчёт архива ----------------------------------------------------------------
+
+def _last_run(db: Session, kind: str) -> PipelineRun | None:
+    return db.scalar(select(PipelineRun).where(PipelineRun.kind == kind).order_by(PipelineRun.id.desc()).limit(1))
+
+
+@router.get("/pipeline", response_model=PipelineOut, tags=["pipeline"])
+def pipeline(db: Db) -> PipelineOut:
+    dataset, rerun = _last_run(db, "dataset"), _last_run(db, "rerun")
+    last_done = db.scalar(select(Job).where(Job.status == "done").order_by(Job.finished_at.desc()).limit(1))
+    out = PipelineOut(dataset_version=dataset.version if dataset else None,
+                      dataset_stage=dataset.status if dataset else "idle",
+                      model_version=last_done.detector if last_done else None,
+                      total_videos=db.scalar(select(func.count()).select_from(Video)) or 0)
+    if rerun:
+        jobs = db.scalars(select(Job).where(Job.requested_by == f"rerun:{rerun.id}")).all()
+        for job in jobs:
+            _expire(db, job)
+        out.total_videos = rerun.total
+        out.processed_videos = sum(j.status in ("done", "failed") for j in jobs)
+        failed = [j for j in jobs if j.status == "failed"]
+        out.batch_stage = "running" if out.processed_videos < rerun.total else ("failed" if failed else "ready")
+        out.error = failed[0].error if failed else None
+    return out
+
+
+@router.post("/pipeline/dataset", response_model=PipelineOut, tags=["pipeline"])
+def build_dataset(db: Db) -> PipelineOut:
+    """Версия набора для дообучения: COCO из правок боксов человеком + примеры опубликованных собственных типов."""
+    version = "ds-" + now().strftime("%Y%m%d-%H%M%S")
+    published = db.scalars(select(EventType).where(EventType.status == "published")).all()
+    data = {"version": version, "boxes": training_export(db),
+            "event_types": [event_type_out(db, t).model_dump() for t in published]}
+    run = PipelineRun(kind="dataset", status="ready", version=version, total=len(data["boxes"]["images"]))
+    try:
+        storage.put_bytes(f"datasets/{version}.json", json.dumps(data, ensure_ascii=False, default=str).encode(),
+                          "application/json")
+    except Exception as e:  # S3 недоступен — версия не собрана
+        run.status, run.error = "failed", str(e)[:500]
+    db.add(run)
+    db.commit()
+    return pipeline(db)
+
+
+@router.post("/pipeline/train", tags=["pipeline"])
+def train_model() -> None:
+    raise HTTPException(status_code=409, detail="Обучение детектора запускается на GPU вручную, чтобы не останавливать "
+                                                "анализ: docker compose --profile tools run --rm cv python -m "
+                                                "cv.train_yolo --dataset det_l1 (см. computer-vision/README.md)")
+
+
+@router.post("/pipeline/rerun", response_model=PipelineOut, tags=["pipeline"])
+async def rerun_archive(db: Db) -> PipelineOut:
+    """Повторный анализ всех записей текущей моделью."""
+    videos = db.scalars(select(Video).order_by(Video.uploaded_at)).all()
+    run = PipelineRun(kind="rerun", status="running", total=len(videos))
+    db.add(run)
+    db.commit()
+    for video in videos:
+        job = Job(id=uuid.uuid4().hex[:12], video_id=video.id, requested_by=f"rerun:{run.id}", stage="queued")
+        db.add(job)
+        db.commit()
+        progress.set_stage(job.id, "queued", 0.0)
+        await temporal_client.start_analysis(job.id)
+    return pipeline(db)
 
 
 # --- камеры и справочники ------------------------------------------------------------------------------------------
