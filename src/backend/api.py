@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import shutil
+import subprocess
 import tempfile
 import time
 import uuid
@@ -17,10 +18,12 @@ from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, SecretStr
 from sqlalchemy import func, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
-from backend import catalog, config, media, progress, storage, temporal_client
-from backend.auth import (COOKIE_NAME, SESSION_SECONDS, authentication, new_session, require_key,
+from backend import catalog, config, deadlines, jobs, media, progress, storage, temporal_client
+from backend import evidence as result_evidence
+from backend.auth import (COOKIE_NAME, SESSION_SECONDS, authentication, new_session, require_jury_key, require_key,
                           require_same_origin, session_expiry, valid_key)
 from backend.db import (
     Box, Event, EventSample, EventType, Job, PipelineRun, SessionLocal, Video, get_db, now,
@@ -33,6 +36,7 @@ from backend.schema import (
 )
 
 router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_key)])
+jury_router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_jury_key)])
 public_router = APIRouter(prefix="/api/v1")
 Db = Annotated[Session, Depends(get_db)]
 VIOLATION_MERGE_SEC = 5.0  # события одного типа ближе 5 с — один эпизод нарушения
@@ -94,49 +98,108 @@ def _save_upload(file: UploadFile, dst: Path) -> None:
     size = 0
     with dst.open("wb") as out:
         while chunk := file.file.read(1 << 20):
+            deadlines.remaining()
             size += len(chunk)
             if size > config.MAX_UPLOAD_MB * 1024 * 1024:
                 raise HTTPException(status_code=413, detail=f"file larger than {config.MAX_UPLOAD_MB} MB")
             out.write(chunk)
 
 
-def _store_video(src: Path, video_id: str) -> tuple[dict, str, str]:
+def _store_video(src: Path, video_id: str) -> tuple[dict, str, str | None]:
     """Метаданные, sha256, оригинал и mp4 для плеера в S3."""
     try:
         info = media.probe(src)
-    except Exception as e:  # noqa: BLE001
+    except subprocess.TimeoutExpired as e:
+        raise TimeoutError("video probe timed out") from e
+    except (ValueError, subprocess.CalledProcessError) as e:
         raise HTTPException(status_code=422, detail="not a video file") from e
     sha = media.sha256_file(src)
     source_key = f"videos/{video_id}/source{src.suffix}"
     storage.put_file(source_key, str(src), "video/quicktime" if src.suffix == ".mov" else "video/mp4")
     play = src.with_name("play.mp4")
-    media.remux_mp4(src, play)
-    storage.put_file(f"videos/{video_id}/play.mp4", str(play), "video/mp4")
-    return {**info, "sha256": sha, "size": src.stat().st_size}, source_key, f"videos/{video_id}/play.mp4"
+    play_key = None
+    try:
+        media.remux_mp4(src, play)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        # MOV codecs need not fit MP4. The original is sufficient for analysis.
+        pass
+    else:
+        play_key = f"videos/{video_id}/play.mp4"
+        storage.put_file(play_key, str(play), "video/mp4")
+    deadlines.remaining()
+    return {**info, "sha256": sha, "size": src.stat().st_size}, source_key, play_key
 
 
-async def ingest(file: UploadFile, db: Session, *, source: str, requested_by: str,
-                 recorded_at: datetime | None = None) -> tuple[Video, Job]:
+def _process_upload(file: UploadFile, video_id: str, ext: str) -> tuple[dict, str, str | None]:
+    # The worker thread owns the temporary directory even if the request times out.
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / f"source{ext}"
+        _save_upload(file, src)
+        return _store_video(src, video_id)
+
+
+def _persist_upload(video: Video, job: Job) -> None:
+    # A timed-out request must not close a session still used by a worker.
+    with SessionLocal() as db:
+        deadlines.remaining()
+        db.add(video)
+        db.flush()  # No ORM relationships: persist the video before its job.
+        deadlines.remaining()
+        db.add(job)
+        db.flush()
+        deadlines.remaining()
+        db.commit()
+        deadlines.remaining()
+
+
+def _submission_failed(job_id: str, error: str) -> Job:
+    with SessionLocal() as db:
+        deadlines.remaining()
+        jobs.mark_failed(db, job_id, error)
+        return db.get(Job, job_id)
+
+
+async def _start_job(job: Job) -> Job:
+    try:
+        remaining = jobs.seconds_left(job)
+        if remaining <= 0:
+            raise TimeoutError(jobs.TIMEOUT_ERROR)
+        async with asyncio.timeout(min(10, remaining)):
+            await temporal_client.start_analysis(job.id)
+    except Exception as exc:
+        return await run_in_threadpool(_submission_failed, job.id, f"analysis could not start: {exc}")
+    return job
+
+
+async def ingest(file: UploadFile, *, source: str, requested_by: str,
+                 recorded_at: datetime | None = None, received_at: datetime | None = None) -> tuple[Video, Job]:
+    received_at = received_at or now()
     ext = Path(file.filename or "").suffix.lower()
     allowed = {".mov"} if source == "api" else {".mov", ".mp4"}
     if ext not in allowed:
         raise HTTPException(status_code=415, detail=f"expected {'/'.join(sorted(allowed))} file in field 'file'")
     video_id, job_id = uuid.uuid4().hex[:12], uuid.uuid4().hex[:12]
-    with tempfile.TemporaryDirectory() as tmp:
-        src = Path(tmp) / f"source{ext}"
-        await run_in_threadpool(_save_upload, file, src)
-        info, source_key, play_key = await run_in_threadpool(_store_video, src, video_id)
-    video = Video(id=video_id, filename=file.filename or src.name, source_key=source_key, play_key=play_key,
-                  sha256=info["sha256"], size=info["size"], duration=info["duration"], fps=info["fps"],
-                  width=info["width"], height=info["height"], source=source, recorded_at=recorded_at or now())
-    job = Job(id=job_id, video_id=video_id, requested_by=requested_by, stage="queued")
-    db.add(video)
-    db.flush()  # связей в моделях нет: без flush задача может уйти в БД раньше видео
-    db.add(job)
-    db.commit()
-    progress.set_stage(job_id, "queued", 0.0)
-    await temporal_client.start_analysis(job_id)
-    return video, job
+    try:
+        remaining = config.JOB_TIMEOUT_SEC - (now() - received_at).total_seconds()
+        with deadlines.budget(remaining):
+            async with asyncio.timeout(deadlines.remaining(config.JOB_TIMEOUT_SEC)):
+                info, source_key, play_key = await run_in_threadpool(_process_upload, file, video_id, ext)
+                deadlines.remaining()
+                video = Video(id=video_id, filename=file.filename or f"source{ext}", source_key=source_key, play_key=play_key,
+                              sha256=info["sha256"], size=info["size"], duration=info["duration"], fps=info["fps"],
+                              width=info["width"], height=info["height"], source=source, recorded_at=recorded_at or now())
+                job = Job(id=job_id, video_id=video_id, requested_by=requested_by, stage="queued", created_at=received_at)
+                await run_in_threadpool(_persist_upload, video, job)
+                await run_in_threadpool(progress.set_stage, job_id, "queued", 0.0)
+                job = await _start_job(job)
+                deadlines.remaining()
+                return video, job
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="video processing deadline exceeded") from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail="video storage or database is unavailable") from exc
 
 
 # --- преобразования ------------------------------------------------------------------------------------------------
@@ -144,18 +207,14 @@ async def ingest(file: UploadFile, db: Session, *, source: str, requested_by: st
 def _stale(job: Job) -> bool:
     """Задача дольше лимита. Пересчёт архива запускает задачи по одной (RerunArchive): ожидание своей очереди
     в лимит не входит, отсчёт — от старта обработки."""
-    since = job.started_at or (None if job.requested_by.startswith("rerun:") else job.created_at)
-    if since is None or job.status not in ("queued", "processing"):
-        return False
-    since = since if since.tzinfo else since.replace(tzinfo=UTC)
-    return now() - since > timedelta(seconds=config.JOB_TIMEOUT_SEC + 30)
+    return job.status in jobs.ACTIVE and jobs.expired(job, now())
 
 
 def _expire(db: Session, job: Job) -> None:
     """Workflow убит по таймауту, не успев записать failed, — фиксируем сами."""
     if _stale(job):
-        job.status, job.error, job.finished_at = "failed", "timeout: обработка не уложилась в лимит", now()
-        db.commit()
+        jobs.mark_failed(db, job.id, jobs.TIMEOUT_ERROR)
+        db.refresh(job)
 
 
 def job_out(job: Job, position: int | None = None, eta: float | None = None) -> JobOut:
@@ -199,22 +258,28 @@ def norm_rule(norm_id: str | None) -> tuple[Rule | None, str]:
 
 
 def violation_groups(db: Session, job: Job) -> list[list[Event]]:
-    """События-нарушения одного типа ближе VIOLATION_MERGE_SEC — один эпизод; без кадра-доказательства эпизод
-    в ответ жюри не попадает."""
-    events = db.scalars(select(Event).where(Event.job_id == job.id, Event.status == "violation")
+    """Соседние события одного типа — один эпизод. Отсутствие кадров не скрывает нарушение."""
+    events = db.scalars(select(Event).where(Event.job_id == job.id, Event.status == "violation",
+                                           func.coalesce(Event.source, "model") != "human")
                         .order_by(Event.t_start)).all()
     groups: list[list[Event]] = []
     for e in events:
-        if groups and groups[-1][0].title == e.title and e.t_start - groups[-1][-1].t_start <= VIOLATION_MERGE_SEC:
+        if (groups and (groups[-1][0].title or groups[-1][0].event) == (e.title or e.event)
+                and e.t_start - groups[-1][-1].t_start <= VIOLATION_MERGE_SEC):
             groups[-1].append(e)
         else:
             groups.append([e])
-    return [g for g in groups if any(e.evidence for e in g)]
+    return groups
 
 
 def violations_for(db: Session, job: Job) -> list[Violation]:
     result = []
+    video = db.get(Video, job.video_id)
     for group in violation_groups(db, job):
+        for event in group:
+            result_evidence.validate_violation(
+                {"t_start": event.t_start, "t_end": event.t_end, "title": event.title, "event": event.event,
+                 "message": event.message, "evidence": event.evidence}, video.duration, read_frames=False)
         first = group[0]
         frames = [ev for e in group for ev in (e.evidence or [])][:3]
         rule, norm_text = norm_rule(next((e.norm for e in group if e.norm), None))
@@ -222,7 +287,7 @@ def violations_for(db: Session, job: Job) -> list[Violation]:
         result.append(Violation(
             type=first.title or first.event, timecode_sec=round(first.t_start, 2), description=description,
             evidence_frames=[EvidenceFrame(timestamp_sec=round(f["t"], 2),
-                                           image_base64=base64.b64encode(storage.get_bytes(f["key"])).decode())
+                                           image_base64=base64.b64encode(result_evidence.jpeg_bytes(f)).decode())
                              for f in frames],
             rule=rule,
         ))
@@ -251,8 +316,9 @@ def queue_snapshot(db: Session) -> dict:
 
 def jury_result(job_id: str) -> JobResponse:
     """Ответ жюри по задаче — своя сессия: длинный опрос читает БД заново на каждом шаге."""
-    with SessionLocal() as db:
+    with deadlines.budget(config.RESULT_READ_TIMEOUT_SEC), SessionLocal() as db:
         job = db.get(Job, job_id)
+        deadlines.remaining()
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
         _expire(db, job)
@@ -260,7 +326,19 @@ def jury_result(job_id: str) -> JobResponse:
             return JobResponse(job_id=job.id, status="processing")
         if job.status == "failed":
             return JobResponse(job_id=job.id, status="failed", error=job.error)
-        violations = violations_for(db, job)
+        try:
+            violations = violations_for(db, job)
+            deadlines.remaining()
+            if job.verdict == "violation" and not violations:
+                raise result_evidence.InvalidResult("violation verdict has no events")
+        except TimeoutError:
+            raise
+        except Exception as exc:
+            # A worker finishing after its caller timed out must not change a terminal result.
+            deadlines.remaining()
+            jobs.mark_failed(db, job.id, f"invalid or unavailable analysis result: {exc}", statuses=("done",))
+            db.refresh(job)
+            return JobResponse(job_id=job.id, status="failed", error=job.error)
         return JobResponse(job_id=job.id, status="done", verdict="violation" if violations else "no_violation",
                            violations=violations)
 
@@ -286,26 +364,29 @@ ERRORS = {401: {"model": ErrorOut, "description": "Нет ключа или кл
           404: {"model": ErrorOut, "description": "Задача не найдена"}}
 UPLOAD_ERRORS = {401: ERRORS[401], 413: {"model": ErrorOut, "description": "Файл больше 200 МБ"},
                  415: {"model": ErrorOut, "description": "Не .mov в поле file"},
-                 422: {"model": ErrorOut, "description": "Файл не читается как видео"}}
+                  422: {"model": ErrorOut, "description": "Файл не читается как видео"},
+                  503: {"model": ErrorOut, "description": "Хранилище видео или БД недоступны"},
+                  504: {"model": ErrorOut, "description": "Истёк срок приёма и подготовки видео"}}
 
 
 # --- API жюри и ботов (ключ) ---------------------------------------------------------------------------------------
 
-@router.post("/analyze", response_model=AnalyzeResponse, tags=["jury"], responses=UPLOAD_ERRORS,
+@jury_router.post("/analyze", response_model=AnalyzeResponse, tags=["jury"], responses=UPLOAD_ERRORS,
              summary="Загрузить видео на проверку")
-async def analyze(file: Annotated[UploadFile, File(description="Видео .mov, до 200 МБ")], db: Db,
-                  who: Annotated[str, Depends(require_key)]) -> AnalyzeResponse:
+async def analyze(request: Request, file: Annotated[UploadFile, File(description="Видео .mov, до 200 МБ")],
+                  who: Annotated[str, Depends(require_jury_key)]) -> AnalyzeResponse:
     """Шаг 1: видео уходит в очередь, в ответ — `job_id`. Результат — `GET /api/v1/jobs/{job_id}`."""
-    _, job = await ingest(file, db, source="api", requested_by=who)
+    _, job = await ingest(file, source="api", requested_by=who, received_at=request.state.received_at)
     return AnalyzeResponse(job_id=job.id)
 
 
-@router.get("/jobs/{job_id}", response_model=JobResponse, response_model_exclude_none=True, tags=["jury"],
+@jury_router.get("/jobs/{job_id}", response_model=JobResponse, response_model_exclude_none=True, tags=["jury"],
             summary="Статус и результат", responses={
                 200: {"content": {"application/json": {"examples": JOB_EXAMPLES}},
                       "headers": {"Retry-After": {"description": "При processing: через сколько секунд спросить снова",
-                                                  "schema": {"type": "integer"}}}}, **ERRORS})
-async def get_job(job_id: str, response: Response, _: Annotated[str, Depends(require_key)],
+                                                  "schema": {"type": "integer"}}}}, **ERRORS,
+                503: {"model": ErrorOut, "description": "Результат временно недоступен"}})
+async def get_job(job_id: str, response: Response, _: Annotated[str, Depends(require_jury_key)],
                   wait: Annotated[float, Query(ge=0, le=60, description="Длинный опрос: подождать до N секунд, пока "
                                                                        "задача не выйдет из processing")] = 0
                   ) -> JobResponse:
@@ -313,7 +394,11 @@ async def get_job(job_id: str, response: Response, _: Annotated[str, Depends(req
     `failed` с `error`. С `wait` ответ приходит сразу по готовности — меньше запросов при опросе."""
     deadline = time.monotonic() + wait
     while True:
-        result = await run_in_threadpool(jury_result, job_id)
+        try:
+            with deadlines.budget(config.RESULT_READ_TIMEOUT_SEC):
+                result = await asyncio.wait_for(run_in_threadpool(jury_result, job_id), config.RESULT_READ_TIMEOUT_SEC)
+        except (TimeoutError, SQLAlchemyError) as exc:
+            raise HTTPException(status_code=503, detail="analysis result is temporarily unavailable") from exc
         if result.status != "processing" or time.monotonic() >= deadline:
             break
         await asyncio.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
@@ -371,7 +456,7 @@ async def health(db: Db) -> HealthOut:
 @router.post("/videos", response_model=UploadOut, tags=["videos"])
 async def upload_video(db: Db, file: Annotated[UploadFile, File()],
                        recorded_at: Annotated[datetime | None, Form()] = None) -> UploadOut:
-    video, job = await ingest(file, db, source="upload", requested_by="ui", recorded_at=recorded_at)
+    video, job = await ingest(file, source="upload", requested_by="ui", recorded_at=recorded_at)
     return UploadOut(video=video_out(db, video), job=job_out(job))
 
 
@@ -425,7 +510,8 @@ def stream_video(video_id: str, request: Request, db: Db) -> StreamingResponse:
         if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
             raise HTTPException(status_code=404, detail="video file not found") from e
         raise
-    return StreamingResponse(body, status_code=status, headers=headers, media_type="video/mp4")
+    content_type = "video/quicktime" if key.endswith(".mov") else "video/mp4"
+    return StreamingResponse(body, status_code=status, headers=headers, media_type=content_type)
 
 
 @router.get("/videos/{video_id}/frame", tags=["videos"], response_class=Response)
@@ -447,7 +533,7 @@ async def reanalyze(video_id: str, db: Db) -> JobOut:
     db.add(job)
     db.commit()
     progress.set_stage(job.id, "queued", 0.0)
-    await temporal_client.start_analysis(job.id)
+    job = await _start_job(job)
     return job_out(job)
 
 

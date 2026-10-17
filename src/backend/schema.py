@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 JobStatus = Literal["queued", "processing", "done", "failed"]
 Verdict = Literal["violation", "no_violation"]
@@ -14,7 +14,7 @@ Review = Literal["pending", "approved", "rejected", "none"]
 # --- API жюри ---------------------------------------------------------------------------------------------------
 
 class EvidenceFrame(BaseModel):
-    timestamp_sec: float = Field(description="Секунда кадра от начала видео")
+    timestamp_sec: float = Field(ge=0, allow_inf_nan=False, description="Секунда кадра от начала видео")
     image_base64: str = Field(description="Кадр-доказательство: JPEG в base64, без префикса data:")
 
 
@@ -27,9 +27,9 @@ class Rule(BaseModel):
 
 
 class Violation(BaseModel):
-    type: str = Field(description="Тип нарушения")
-    timecode_sec: float = Field(description="Таймкод события в секундах от начала видео")
-    description: str = Field(description="Что видно на видео и почему это может быть нарушением; в конце — норматив")
+    type: str = Field(min_length=1, description="Тип нарушения")
+    timecode_sec: float = Field(ge=0, allow_inf_nan=False, description="Таймкод события в секундах от начала видео")
+    description: str = Field(min_length=1, description="Что видно на видео и почему это может быть нарушением; в конце — норматив")
     evidence_frames: list[EvidenceFrame] = Field(min_length=1, max_length=3,
                                                  description="1–3 кадра-доказательства; первый — на таймкоде")
     rule: Rule | None = Field(None, description="Сверх схемы ТЗ: прямой норматив, если он есть")
@@ -48,6 +48,18 @@ class JobResponse(BaseModel):
     violations: list[Violation] | None = Field(None, description="Только при done: список нарушений, пустой — если "
                                                                    "нарушений нет")
     error: str | None = Field(None, description="Только при failed: причина")
+
+    @model_validator(mode="after")
+    def complete_result(self):
+        if self.status == "done":
+            if self.verdict is None or self.violations is None:
+                raise ValueError("done requires verdict and violations")
+            expected = "violation" if self.violations else "no_violation"
+            if self.verdict != expected:
+                raise ValueError("verdict must match violations")
+        elif self.verdict is not None or self.violations is not None:
+            raise ValueError("only done may contain a result")
+        return self
 
 
 class ErrorOut(BaseModel):

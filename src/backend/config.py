@@ -17,6 +17,7 @@ TEMPORAL_NAMESPACE = os.environ.get("TEMPORAL_NAMESPACE", "default")
 ANALYZE_QUEUE = "analyze"  # workflow и активности бэкенда
 CV_QUEUE = "cv-gpu"  # активность run_cv в cv-worker, одна за раз
 JOB_TIMEOUT_SEC = 270  # лимит жюри — 5 минут на видео
+RESULT_READ_TIMEOUT_SEC = 20  # запас до 300 с на сборку ответа с кадрами
 
 VALKEY_URL = os.environ.get("VALKEY_URL", "redis://localhost:46379/0")
 

@@ -18,11 +18,11 @@ CV_QUEUE = "cv-gpu"
 class AnalyzeVideo:
     @workflow.run
     async def run(self, job_id: str) -> str:
-        task = await workflow.execute_activity(
-            "prepare", job_id, task_queue=ANALYZE_QUEUE,
-            start_to_close_timeout=timedelta(seconds=30), retry_policy=RetryPolicy(maximum_attempts=3),
-        )
         try:
+            task = await workflow.execute_activity(
+                "prepare", job_id, task_queue=ANALYZE_QUEUE,
+                start_to_close_timeout=timedelta(seconds=30), retry_policy=RetryPolicy(maximum_attempts=3),
+            )
             result = await workflow.execute_activity(
                 "run_cv", task, task_queue=CV_QUEUE,
                 schedule_to_close_timeout=timedelta(seconds=250), retry_policy=RetryPolicy(maximum_attempts=1),

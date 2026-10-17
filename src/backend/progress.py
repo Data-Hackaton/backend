@@ -3,6 +3,8 @@
 import json
 
 import redis
+from redis.backoff import NoBackoff
+from redis.retry import Retry
 
 from backend.config import VALKEY_URL
 
@@ -14,7 +16,9 @@ _client = None
 def client() -> redis.Redis:
     global _client
     if _client is None:
-        _client = redis.Redis.from_url(VALKEY_URL, decode_responses=True)
+        # Optional progress must never consume the jury's processing deadline.
+        _client = redis.Redis.from_url(VALKEY_URL, decode_responses=True, socket_connect_timeout=0.2,
+                                      socket_timeout=0.2, retry=Retry(NoBackoff(), 0))
     return _client
 
 

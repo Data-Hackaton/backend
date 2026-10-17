@@ -10,7 +10,7 @@ from itsdangerous import TimestampSigner
 from backend import auth, config, storage
 from backend.db import ApiToken, SessionLocal
 from backend.main import app
-from test_api import client, finish_job, mov, s3, started, upload_api, violation_event  # noqa: F401
+from test_api import client, finish_job, jpeg_bytes, mov, s3, started, upload_api, violation_event  # noqa: F401
 
 ORIGIN = {"Origin": "http://testserver"}
 
@@ -123,7 +123,7 @@ def test_cookie_upload_evidence_range_and_edit(client, mov, s3, monkeypatch):
     video_id, job_id = result.json()['video']['id'], result.json()['job']['id']
     finish_job(s3, job_id, [violation_event(1, job_id=job_id)])
     event = client.get(f'/api/v1/videos/{video_id}/events').json()[0]
-    assert client.get(event['evidence'][0]['url']).content == b'\xff\xd8jpeg'
+    assert client.get(event['evidence'][0]['url']).content == jpeg_bytes()
     seen = []
     def stream(key, value):
         seen.append(value)

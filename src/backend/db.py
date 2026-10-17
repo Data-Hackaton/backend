@@ -4,6 +4,7 @@ from collections.abc import Iterator
 from datetime import UTC, datetime
 
 from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, event
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from backend.config import DATABASE_URL
@@ -143,7 +144,12 @@ class Box(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now)
 
 
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+# Bound server-side waits too, so abandoned request workers release DB resources.
+_engine_options = {}
+if make_url(DATABASE_URL).get_backend_name() == "postgresql":
+    _engine_options = {"pool_timeout": 5, "connect_args": {
+        "connect_timeout": 5, "options": "-c statement_timeout=10000 -c lock_timeout=3000"}}
+engine = create_engine(DATABASE_URL, pool_pre_ping=True, **_engine_options)
 if engine.dialect.name == "sqlite":  # тесты: внешние ключи проверяются, как в Postgres
     event.listen(engine, "connect", lambda conn, _: conn.execute("PRAGMA foreign_keys=ON"))
 SessionLocal = sessionmaker(engine, expire_on_commit=False)

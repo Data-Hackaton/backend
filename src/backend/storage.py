@@ -8,12 +8,14 @@
 """
 
 from collections.abc import Iterator
+from contextlib import closing
 
 import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
 from backend.config import S3_ACCESS_KEY, S3_BUCKET, S3_ENDPOINT, S3_SECRET_KEY
+from backend import deadlines
 
 _client = None
 
@@ -23,7 +25,9 @@ def client():
     if _client is None:
         _client = boto3.client(
             "s3", endpoint_url=S3_ENDPOINT, aws_access_key_id=S3_ACCESS_KEY, aws_secret_access_key=S3_SECRET_KEY,
-            region_name="us-east-1", config=Config(s3={"addressing_style": "path"}, signature_version="s3v4"),
+            region_name="us-east-1", config=Config(s3={"addressing_style": "path"}, signature_version="s3v4",
+                                                 connect_timeout=3, read_timeout=10,
+                                                 retries={"total_max_attempts": 1}),
         )
     return _client
 
@@ -36,7 +40,9 @@ def ensure_bucket() -> None:
 
 
 def put_file(key: str, path: str, content_type: str) -> None:
+    deadlines.remaining()
     client().upload_file(path, S3_BUCKET, key, ExtraArgs={"ContentType": content_type})
+    deadlines.remaining()
 
 
 def put_bytes(key: str, data: bytes, content_type: str) -> None:
@@ -44,7 +50,14 @@ def put_bytes(key: str, data: bytes, content_type: str) -> None:
 
 
 def get_bytes(key: str) -> bytes:
-    return client().get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+    deadlines.remaining()
+    with closing(client().get_object(Bucket=S3_BUCKET, Key=key)["Body"]) as body:
+        chunks = []
+        for chunk in body.iter_chunks(64 * 1024):
+            deadlines.remaining()
+            chunks.append(chunk)
+    deadlines.remaining()
+    return b"".join(chunks)
 
 
 def presign(key: str, expires: int = 3600) -> str:

@@ -1,6 +1,7 @@
 import base64
 import json
 import subprocess
+from functools import lru_cache
 
 import pytest
 from botocore.exceptions import ClientError
@@ -51,9 +52,10 @@ def client(s3, started):
 
 
 @pytest.fixture
-def mov(tmp_path):
+def mov(tmp_path, request):
     path = tmp_path / "sample.mov"
-    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=duration=3:size=160x120:rate=10",
+    duration = getattr(request, "param", 3)
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"testsrc=duration={duration}:size=160x120:rate=10",
                     "-pix_fmt", "yuv420p", str(path)], check=True)
     return path
 
@@ -63,11 +65,20 @@ def upload_api(client, mov, headers=ADMIN, name="sample.mov"):
         return client.post("/api/v1/analyze", headers=headers, files={"file": (name, f)})
 
 
+@lru_cache(maxsize=1)
+def jpeg_bytes():
+    return subprocess.run(
+        ["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=160x120:rate=10",
+         "-frames:v", "1", "-f", "image2pipe", "-c:v", "mjpeg", "-"],
+        capture_output=True, check=True,
+    ).stdout
+
+
 def finish_job(s3, job_id, events, boxes=(), verdict="violation"):
     """То, что делает cv-worker + publish: результат в S3 и в БД."""
     s3[f"jobs/{job_id}/events.json"] = json.dumps(events).encode()
     s3[f"jobs/{job_id}/boxes.json"] = json.dumps(list(boxes)).encode()
-    s3[f"jobs/{job_id}/evidence/0.jpg"] = b"\xff\xd8jpeg"
+    s3[f"jobs/{job_id}/evidence/0.jpg"] = jpeg_bytes()
     activities.prepare(job_id)
     activities.publish({"job_id": job_id, "verdict": verdict, "detector": "stub",
                         "events_key": f"jobs/{job_id}/events.json", "boxes_key": f"jobs/{job_id}/boxes.json"})
@@ -96,6 +107,7 @@ def test_tokens_coming_soon(client):
     assert client.delete("/api/v1/tokens/1").status_code == 501
 
 
+@pytest.mark.parametrize("mov", [90], indirect=True)
 def test_analyze_then_done_in_jury_schema(client, mov, s3, started):
     job_id = upload_api(client, mov).json()["job_id"]
     assert started == [job_id]
@@ -113,6 +125,8 @@ def test_analyze_then_done_in_jury_schema(client, mov, s3, started):
     assert "Правила №231, п.20" in v["description"]
     assert v["rule"]["clause"] == "пункт 20"
     assert base64.b64decode(v["evidence_frames"][0]["image_base64"]).startswith(b"\xff\xd8")
+    from backend.media import validate_jpeg
+    validate_jpeg(base64.b64decode(v["evidence_frames"][0]["image_base64"], validate=True))
 
 
 def test_done_without_violations(client, mov, s3):
@@ -141,7 +155,7 @@ def test_ui_upload_video_queue_and_calendar(client, mov, s3):
 
 def test_review_flow(client, mov, s3):
     job_id = upload_api(client, mov).json()["job_id"]
-    finish_job(s3, job_id, [violation_event(5.0, job_id=job_id),
+    finish_job(s3, job_id, [violation_event(1.5, job_id=job_id),
                             {"t_start": 1.0, "t_end": 1.0, "event": "person_enter", "status": "expected"}])
     pending = client.get("/api/v1/review").json()
     assert len(pending) == 1 and pending[0]["status"] == "violation"  # ожидаемые события в ревью не попадают
@@ -155,7 +169,7 @@ def test_review_flow(client, mov, s3):
 def test_boxes_human_override_and_export(client, mov, s3):
     job_id = upload_api(client, mov).json()["job_id"]
     video_id = client.get(f"/api/v1/queue/jobs/{job_id}").json()["video_id"]
-    finish_job(s3, job_id, [], boxes=[{"t": 1.0, "cls": "person", "bbox": [1, 2, 30, 60], "conf": 0.8},
+    finish_job(s3, job_id, [], verdict="no_violation", boxes=[{"t": 1.0, "cls": "person", "bbox": [1, 2, 30, 60], "conf": 0.8},
                                       {"t": 2.0, "cls": "table", "bbox": [0, 50, 160, 120], "conf": 0.9}])
     assert len(client.get(f"/api/v1/videos/{video_id}/boxes").json()) == 2
 

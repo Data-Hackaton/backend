@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from backend import config, storage
-from backend.api import public_router, router
+from backend.api import jury_router, public_router, router
 from backend.auth import AccessMiddleware
 from backend.db import init_db
 
@@ -32,7 +32,7 @@ DESCRIPTION = """
 2. `GET /api/v1/jobs/{job_id}` — `processing`, пока видео в очереди или в работе; затем `done` с `verdict` и
    `violations` или `failed` с `error`.
 
-Ключ — в заголовке `X-API-Key` (или `Authorization: Bearer <ключ>`); без верного ключа — `401`.
+Для этих двух методов ключ обязателен в заголовке `X-API-Key`; Bearer и cookie его не заменяют. Без него — `401`.
 В этой странице ключ задаётся один раз кнопкой **Authorize**.
 
 ```
@@ -44,11 +44,14 @@ curl "http://localhost:48000/api/v1/jobs/<job_id>?wait=30" -H "X-API-Key: <кл�
 не будет готова, — один запрос вместо десятка. Где задача в очереди и на каком этапе — `/api/v1/jobs/{job_id}/progress`;
 готов ли сервис принимать видео — `/api/v1/health` (без ключа).
 
-**Лимиты.** Видео до 200 МБ. Обработка укладывается в 5 минут: задача, не успевшая за 4,5 минуты, отдаётся как
-`failed`. Пересчёт архива идёт по одной записи и не задерживает видео жюри.
+**Лимиты.** Видео до 200 МиБ. Бюджет задачи — 270 секунд от начала приёма POST, включая подготовку и очередь;
+просроченная задача отдаётся как `failed`, оставляя резерв до лимита 5 минут на получение ответа. Отсутствующие
+или повреждённые кадры также означают `failed`. MOV принимается и при невозможности создать MP4 для плеера.
+Сборка ответа GET из БД и S3 ограничена 20 секундами; превышение возвращает `503`.
 
 **Коды ошибок:** `401` — нет ключа или ключ неверный, `404` — нет задачи, `413` — файл больше 200 МБ,
-`415` — не `.mov` в поле `file`, `422` — файл не читается как видео. Тело ошибки — `{"detail": "…"}`.
+`415` — не `.mov` в поле `file`, `422` — файл не читается как видео, `503` — хранилище, БД или результат недоступны,
+`504` — срок приёма/подготовки истёк. Тело ошибки — `{"detail": "…"}`.
 
 Остальные методы, видео и кадры также требуют ключ или браузерную сессию. Токены ботов — Coming soon.
 Описание контракта — также в `/redoc` (после входа).
@@ -70,6 +73,7 @@ app = FastAPI(title="Forte Видеоаудит — API", version="1.1", descrip
               swagger_ui_parameters={"persistAuthorization": False, "displayRequestDuration": True,
                                      "tryItOutEnabled": True, "defaultModelsExpandDepth": 0})
 app.include_router(public_router)
+app.include_router(jury_router)
 app.include_router(router)
 app.add_middleware(AccessMiddleware)
 
