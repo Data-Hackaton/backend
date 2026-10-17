@@ -43,7 +43,8 @@ def publish(result: dict) -> str:
         for b in boxes:
             db.add(Box(video_id=job.video_id, job_id=job_id, t=b["t"], cls=b["cls"], x1=b["bbox"][0], y1=b["bbox"][1],
                        x2=b["bbox"][2], y2=b["bbox"][3], conf=b.get("conf"), track_id=b.get("track_id"),
-                       attributes=b.get("attributes", {}), source=result.get("detector", "model")))
+                       attributes=b.get("attributes", {}),
+                       source="stub" if result.get("detector") == "stub" else "model"))  # имя модели — в job.detector
         job.status, job.stage, job.verdict = "done", "done", result["verdict"]
         job.detector, job.finished_at = result.get("detector"), now()
         db.commit()

@@ -172,6 +172,20 @@ def test_boxes_human_override_and_export(client, mov, s3):
     assert coco["categories"][coco["annotations"][0]["category_id"] - 1]["name"] == "banknotes"
 
 
+def test_model_boxes_are_source_model(client, mov, s3):
+    job_id = upload_api(client, mov).json()["job_id"]
+    video_id = client.get(f"/api/v1/queue/jobs/{job_id}").json()["video_id"]
+    s3[f"jobs/{job_id}/events.json"] = b"[]"
+    s3[f"jobs/{job_id}/boxes.json"] = json.dumps([{"t": 1.0, "cls": "person", "bbox": [1, 2, 30, 60], "conf": 0.8,
+                                                   "track_id": 1, "attributes": {"role": "cashier"}}]).encode()
+    activities.prepare(job_id)
+    activities.publish({"job_id": job_id, "verdict": "no_violation", "detector": "rfdetr",
+                        "events_key": f"jobs/{job_id}/events.json", "boxes_key": f"jobs/{job_id}/boxes.json"})
+    boxes = client.get(f"/api/v1/videos/{video_id}/boxes").json()
+    assert [(b["source"], b["track_id"], b["attributes"]) for b in boxes] == [("model", 1, {"role": "cashier"})]
+    assert client.get(f"/api/v1/queue/jobs/{job_id}").json()["detector"] == "rfdetr"
+
+
 def test_meta_and_cameras(client):
     assert client.get("/api/v1/cameras").json() == {"items": [], "coming_soon": True}
     meta = client.get("/api/v1/meta").json()
