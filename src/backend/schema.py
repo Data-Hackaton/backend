@@ -14,38 +14,77 @@ Review = Literal["pending", "approved", "rejected", "none"]
 # --- API жюри ---------------------------------------------------------------------------------------------------
 
 class EvidenceFrame(BaseModel):
-    timestamp_sec: float
-    image_base64: str  # JPEG без префикса data:
+    timestamp_sec: float = Field(description="Секунда кадра от начала видео")
+    image_base64: str = Field(description="Кадр-доказательство: JPEG в base64, без префикса data:")
 
 
 class Rule(BaseModel):
     """Нормативный источник. В схеме ТЗ такого поля нет, поэтому ссылка дублируется в конце description."""
 
-    document: str
-    clause: str | None = None
-    url: str | None = None
+    document: str = Field(description="Документ: акт НБРК или иной акт РК")
+    clause: str | None = Field(None, description="Пункт")
+    url: str | None = Field(None, description="Ссылка на adilet.zan.kz")
 
 
 class Violation(BaseModel):
-    type: str
-    timecode_sec: float
-    description: str
-    evidence_frames: list[EvidenceFrame] = Field(min_length=1, max_length=3)
-    rule: Rule | None = None
+    type: str = Field(description="Тип нарушения")
+    timecode_sec: float = Field(description="Таймкод события в секундах от начала видео")
+    description: str = Field(description="Что видно на видео и почему это может быть нарушением; в конце — норматив")
+    evidence_frames: list[EvidenceFrame] = Field(min_length=1, max_length=3,
+                                                 description="1–3 кадра-доказательства; первый — на таймкоде")
+    rule: Rule | None = Field(None, description="Сверх схемы ТЗ: прямой норматив, если он есть")
 
 
 class AnalyzeResponse(BaseModel):
-    job_id: str
+    job_id: str = Field(description="Идентификатор задачи для GET /api/v1/jobs/{job_id}")
 
 
 class JobResponse(BaseModel):
     """Жюри видит processing и для queued: статусов в ТЗ три."""
 
     job_id: str
-    status: Literal["processing", "done", "failed"]
-    verdict: Verdict | None = None
-    violations: list[Violation] | None = None
+    status: Literal["processing", "done", "failed"] = Field(description="processing — в очереди или в работе")
+    verdict: Verdict | None = Field(None, description="Только при done: violation или no_violation")
+    violations: list[Violation] | None = Field(None, description="Только при done: список нарушений, пустой — если "
+                                                                   "нарушений нет")
+    error: str | None = Field(None, description="Только при failed: причина")
+
+
+class ErrorOut(BaseModel):
+    detail: str = Field(description="Причина ошибки")
+
+
+class JobProgress(BaseModel):
+    """Ход обработки для опроса: где задача в очереди и на каком этапе."""
+
+    job_id: str
+    status: JobStatus = Field(description="queued — ждёт свободного обработчика, processing — в работе")
+    stage: str | None = Field(None, description="queued, downloading, detecting, events, evidence, publishing, done")
+    progress: float | None = Field(None, description="Доля выполнения 0–1 текущей задачи")
+    queue_position: int | None = Field(None, description="Место в очереди (для queued)")
+    eta_sec: float | None = Field(None, description="Оценка ожидания до начала обработки, с")
+    created_at: datetime
+    started_at: datetime | None
+    finished_at: datetime | None
     error: str | None = None
+
+
+class JobSummary(BaseModel):
+    job_id: str
+    filename: str
+    status: Literal["processing", "done", "failed"]
+    verdict: Verdict | None
+    violations: int | None = Field(description="Число нарушений в ответе (при done)")
+    created_at: datetime
+    finished_at: datetime | None
+
+
+class HealthOut(BaseModel):
+    status: Literal["ok", "degraded"] = Field(description="degraded — нет обработчика видео или Temporal недоступен")
+    workers: dict[str, int] = Field(description="Сколько воркеров слушают очереди analyze и cv-gpu")
+    queued: int
+    processing: int
+    avg_duration_sec: float | None = Field(description="Средняя обработка за сутки, с")
 
 
 # --- интерфейс ---------------------------------------------------------------------------------------------------

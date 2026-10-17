@@ -1,9 +1,11 @@
 """Маршруты /api/v1: API жюри и ботов (по ключу) и методы интерфейса (открыты). Контракт — docs/API.md."""
 
+import asyncio
 import base64
 import json
 import shutil
 import tempfile
+import time
 import uuid
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -17,11 +19,14 @@ from sqlalchemy.orm import Session
 
 from backend import catalog, config, media, progress, storage, temporal_client
 from backend.auth import hash_token, new_token, require_key
-from backend.db import ApiToken, Box, Event, EventSample, EventType, Job, PipelineRun, Video, get_db, now
+from backend.db import (
+    ApiToken, Box, Event, EventSample, EventType, Job, PipelineRun, SessionLocal, Video, get_db, now,
+)
 from backend.schema import (
-    AnalyzeResponse, BoxIn, BoxOut, CalendarDay, EventOut, EventTypeIn, EventTypeOut, EvidenceFrame, JobOut,
-    JobResponse, ManualEventIn, PipelineOut, QueueOut, QueueWorker, ReviewIn, Rule, SampleIn, SampleOut,
-    SampleReviewIn, TokenCreated, TokenIn, TokenOut, UploadOut, VideoOut, Violation,
+    AnalyzeResponse, BoxIn, BoxOut, CalendarDay, ErrorOut, EventOut, EventTypeIn, EventTypeOut, EvidenceFrame,
+    HealthOut, JobOut, JobProgress, JobResponse, JobSummary, ManualEventIn, PipelineOut, QueueOut, QueueWorker,
+    ReviewIn, Rule, SampleIn, SampleOut, SampleReviewIn, TokenCreated, TokenIn, TokenOut, UploadOut, VideoOut,
+    Violation,
 )
 
 router = APIRouter(prefix="/api/v1")
@@ -102,8 +107,13 @@ async def ingest(file: UploadFile, db: Session, *, source: str, requested_by: st
 # --- преобразования ------------------------------------------------------------------------------------------------
 
 def _stale(job: Job) -> bool:
-    created = job.created_at if job.created_at.tzinfo else job.created_at.replace(tzinfo=UTC)
-    return job.status in ("queued", "processing") and now() - created > timedelta(seconds=config.JOB_TIMEOUT_SEC + 30)
+    """Задача дольше лимита. Пересчёт архива запускает задачи по одной (RerunArchive): ожидание своей очереди
+    в лимит не входит, отсчёт — от старта обработки."""
+    since = job.started_at or (None if job.requested_by.startswith("rerun:") else job.created_at)
+    if since is None or job.status not in ("queued", "processing"):
+        return False
+    since = since if since.tzinfo else since.replace(tzinfo=UTC)
+    return now() - since > timedelta(seconds=config.JOB_TIMEOUT_SEC + 30)
 
 
 def _expire(db: Session, job: Job) -> None:
@@ -153,7 +163,9 @@ def norm_rule(norm_id: str | None) -> tuple[Rule | None, str]:
             f" Норматив: {norm.get('short', norm.get('clause', ''))} ({norm.get('url', '')}).")
 
 
-def violations_for(db: Session, job: Job) -> list[Violation]:
+def violation_groups(db: Session, job: Job) -> list[list[Event]]:
+    """События-нарушения одного типа ближе VIOLATION_MERGE_SEC — один эпизод; без кадра-доказательства эпизод
+    в ответ жюри не попадает."""
     events = db.scalars(select(Event).where(Event.job_id == job.id, Event.status == "violation")
                         .order_by(Event.t_start)).all()
     groups: list[list[Event]] = []
@@ -162,12 +174,14 @@ def violations_for(db: Session, job: Job) -> list[Violation]:
             groups[-1].append(e)
         else:
             groups.append([e])
+    return [g for g in groups if any(e.evidence for e in g)]
+
+
+def violations_for(db: Session, job: Job) -> list[Violation]:
     result = []
-    for group in groups:
+    for group in violation_groups(db, job):
         first = group[0]
         frames = [ev for e in group for ev in (e.evidence or [])][:3]
-        if not frames:
-            continue  # без кадра-доказательства нарушение в ответ жюри не попадает
         rule, norm_text = norm_rule(next((e.norm for e in group if e.norm), None))
         description = (first.message or first.title or first.event) + norm_text
         result.append(Violation(
@@ -180,27 +194,141 @@ def violations_for(db: Session, job: Job) -> list[Violation]:
     return result
 
 
+def queue_snapshot(db: Session) -> dict:
+    """Активные задачи по порядку, место и ожидание для queued (по средней длительности за сутки), счётчики."""
+    for job in db.scalars(select(Job).where(Job.status.in_(["queued", "processing"]))).all():
+        _expire(db, job)
+    day_ago = now() - timedelta(days=1)
+    active = db.scalars(select(Job).where(Job.status.in_(["queued", "processing"])).order_by(Job.created_at)).all()
+    done = db.scalars(select(Job).where(Job.status == "done", Job.finished_at >= day_ago)).all()
+    durations = [(j.finished_at - j.started_at).total_seconds() for j in done if j.started_at and j.finished_at]
+    avg = sum(durations) / len(durations) if durations else None
+    places, waiting = {}, 0
+    for job in active:
+        if job.status == "queued":
+            waiting += 1
+            places[job.id] = (waiting, round(waiting * (avg or 60), 1))
+    failed = db.scalar(select(func.count()).select_from(Job).where(Job.status == "failed", Job.finished_at >= day_ago))
+    return {"active": active, "places": places, "avg": round(avg, 1) if avg else None, "done_24h": len(done),
+            "failed_24h": failed or 0, "queued": sum(j.status == "queued" for j in active),
+            "processing": sum(j.status == "processing" for j in active)}
+
+
+def jury_result(job_id: str) -> JobResponse:
+    """Ответ жюри по задаче — своя сессия: длинный опрос читает БД заново на каждом шаге."""
+    with SessionLocal() as db:
+        job = db.get(Job, job_id)
+        if job is None:
+            raise HTTPException(status_code=404, detail="job not found")
+        _expire(db, job)
+        if job.status in ("queued", "processing"):
+            return JobResponse(job_id=job.id, status="processing")
+        if job.status == "failed":
+            return JobResponse(job_id=job.id, status="failed", error=job.error)
+        violations = violations_for(db, job)
+        return JobResponse(job_id=job.id, status="done", verdict="violation" if violations else "no_violation",
+                           violations=violations)
+
+
+FRAME_EXAMPLE = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcp…"
+JOB_EXAMPLES = {
+    "processing": {"summary": "В очереди или в работе", "value": {"job_id": "3f2a9c1e0b7d", "status": "processing"}},
+    "violation": {"summary": "Готово: нарушение", "value": {
+        "job_id": "3f2a9c1e0b7d", "status": "done", "verdict": "violation", "violations": [{
+            "type": "Деньги предыдущего клиента на кассовом столе", "timecode_sec": 32.27,
+            "description": "32.3 с: Клиент входит в помещение. На рабочем месте кассира только наличные текущего "
+                           "клиента, ранее принятые хранятся в сейфе. Норматив: Правила №231, п.20 "
+                           "(https://adilet.zan.kz/rus/docs/V1900019680#z111).",
+            "evidence_frames": [{"timestamp_sec": 32.27, "image_base64": FRAME_EXAMPLE}],
+            "rule": {"document": "Постановление Правления НБРК от 29 ноября 2019 года № 231", "clause": "пункт 20",
+                     "url": "https://adilet.zan.kz/rus/docs/V1900019680#z111"}}]}},
+    "clean": {"summary": "Готово: нарушений нет",
+              "value": {"job_id": "3f2a9c1e0b7d", "status": "done", "verdict": "no_violation", "violations": []}},
+    "failed": {"summary": "Ошибка обработки", "value": {"job_id": "3f2a9c1e0b7d", "status": "failed",
+                                                        "error": "timeout: обработка не уложилась в лимит"}},
+}
+ERRORS = {401: {"model": ErrorOut, "description": "Нет ключа или ключ неверный"},
+          404: {"model": ErrorOut, "description": "Задача не найдена"}}
+UPLOAD_ERRORS = {401: ERRORS[401], 413: {"model": ErrorOut, "description": "Файл больше 200 МБ"},
+                 415: {"model": ErrorOut, "description": "Не .mov в поле file"},
+                 422: {"model": ErrorOut, "description": "Файл не читается как видео"}}
+
+
 # --- API жюри и ботов (ключ) ---------------------------------------------------------------------------------------
 
-@router.post("/analyze", response_model=AnalyzeResponse, tags=["jury"])
-async def analyze(file: UploadFile, db: Db, who: Annotated[str, Depends(require_key)]) -> AnalyzeResponse:
+@router.post("/analyze", response_model=AnalyzeResponse, tags=["jury"], responses=UPLOAD_ERRORS,
+             summary="Загрузить видео на проверку")
+async def analyze(file: Annotated[UploadFile, File(description="Видео .mov, до 200 МБ")], db: Db,
+                  who: Annotated[str, Depends(require_key)]) -> AnalyzeResponse:
+    """Шаг 1: видео уходит в очередь, в ответ — `job_id`. Результат — `GET /api/v1/jobs/{job_id}`."""
     _, job = await ingest(file, db, source="api", requested_by=who)
     return AnalyzeResponse(job_id=job.id)
 
 
-@router.get("/jobs/{job_id}", response_model=JobResponse, response_model_exclude_none=True, tags=["jury"])
-def get_job(job_id: str, db: Db, _: Annotated[str, Depends(require_key)]) -> JobResponse:
+@router.get("/jobs/{job_id}", response_model=JobResponse, response_model_exclude_none=True, tags=["jury"],
+            summary="Статус и результат", responses={
+                200: {"content": {"application/json": {"examples": JOB_EXAMPLES}},
+                      "headers": {"Retry-After": {"description": "При processing: через сколько секунд спросить снова",
+                                                  "schema": {"type": "integer"}}}}, **ERRORS})
+async def get_job(job_id: str, response: Response, _: Annotated[str, Depends(require_key)],
+                  wait: Annotated[float, Query(ge=0, le=60, description="Длинный опрос: подождать до N секунд, пока "
+                                                                       "задача не выйдет из processing")] = 0
+                  ) -> JobResponse:
+    """Шаг 2: `processing`, пока видео в очереди или в работе; затем `done` с `verdict` и `violations` или
+    `failed` с `error`. С `wait` ответ приходит сразу по готовности — меньше запросов при опросе."""
+    deadline = time.monotonic() + wait
+    while True:
+        result = await run_in_threadpool(jury_result, job_id)
+        if result.status != "processing" or time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+    response.headers["Cache-Control"] = "no-store"
+    if result.status == "processing":
+        response.headers["Retry-After"] = "2"
+    return result
+
+
+@router.get("/jobs/{job_id}/progress", response_model=JobProgress, tags=["jury"], responses=ERRORS,
+            summary="Ход обработки")
+def job_progress(job_id: str, db: Db, _: Annotated[str, Depends(require_key)]) -> JobProgress:
+    """Где задача: место в очереди и ожидание (для queued), этап и доля выполнения (для processing)."""
     job = db.get(Job, job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="job not found")
-    _expire(db, job)
-    if job.status in ("queued", "processing"):
-        return JobResponse(job_id=job.id, status="processing")
-    if job.status == "failed":
-        return JobResponse(job_id=job.id, status="failed", error=job.error)
-    violations = violations_for(db, job)
-    return JobResponse(job_id=job.id, status="done", verdict="violation" if violations else "no_violation",
-                       violations=violations)
+    place = queue_snapshot(db)["places"].get(job.id, (None, None))
+    p = progress.get(job.id) or {}
+    done = job.status == "done"
+    return JobProgress(job_id=job.id, status=job.status, stage="done" if done else p.get("stage", job.stage),
+                       progress=1.0 if done else p.get("progress"), queue_position=place[0],
+                       eta_sec=place[1], created_at=job.created_at, started_at=job.started_at,
+                       finished_at=job.finished_at, error=job.error)
+
+
+@router.get("/jobs", response_model=list[JobSummary], tags=["jury"], responses={401: ERRORS[401]},
+            summary="Мои задачи")
+def my_jobs(db: Db, who: Annotated[str, Depends(require_key)],
+            limit: Annotated[int, Query(ge=1, le=200)] = 50) -> list[JobSummary]:
+    """Задачи, отправленные этим ключом, новые сверху."""
+    out = []
+    for job in db.scalars(select(Job).where(Job.requested_by == who).order_by(Job.created_at.desc()).limit(limit)):
+        _expire(db, job)
+        video = db.get(Video, job.video_id)
+        status = "processing" if job.status in ("queued", "processing") else job.status
+        out.append(JobSummary(job_id=job.id, filename=video.filename if video else "", status=status,
+                              verdict=job.verdict if status == "done" else None,
+                              violations=len(violation_groups(db, job)) if status == "done" else None,
+                              created_at=job.created_at, finished_at=job.finished_at))
+    return out
+
+
+@router.get("/health", response_model=HealthOut, tags=["jury"], summary="Готовность сервиса")
+async def health(db: Db) -> HealthOut:
+    """Без ключа: слушают ли очереди обработчики и сколько задач ждёт. `degraded` — видео сейчас не обработается."""
+    snap = await run_in_threadpool(queue_snapshot, db)
+    workers = await temporal_client.workers()
+    counts = {q: sum(w["queue"] == q for w in workers) for q in (config.ANALYZE_QUEUE, config.CV_QUEUE)}
+    return HealthOut(status="ok" if counts[config.CV_QUEUE] else "degraded", workers=counts, queued=snap["queued"],
+                     processing=snap["processing"], avg_duration_sec=snap["avg"])
 
 
 # --- видео (интерфейс) ---------------------------------------------------------------------------------------------
@@ -282,28 +410,11 @@ async def reanalyze(video_id: str, db: Db) -> JobOut:
 
 @router.get("/queue", response_model=QueueOut, tags=["queue"])
 async def queue(db: Db) -> QueueOut:
-    for job in db.scalars(select(Job).where(Job.status.in_(["queued", "processing"]))).all():
-        _expire(db, job)
-    day_ago = now() - timedelta(days=1)
-    active = db.scalars(select(Job).where(Job.status.in_(["queued", "processing"])).order_by(Job.created_at)).all()
-    done = db.scalars(select(Job).where(Job.status == "done", Job.finished_at >= day_ago)).all()
-    durations = [(j.finished_at - j.started_at).total_seconds() for j in done if j.started_at and j.finished_at]
-    avg = sum(durations) / len(durations) if durations else None
-    jobs, waiting = [], 0
-    for job in active:
-        if job.status == "queued":
-            waiting += 1
-            jobs.append(job_out(job, position=waiting, eta=round(waiting * (avg or 60), 1)))
-        else:
-            jobs.append(job_out(job))
-    return QueueOut(
-        queued=sum(j.status == "queued" for j in active), processing=sum(j.status == "processing" for j in active),
-        done_24h=len(done),
-        failed_24h=db.scalar(select(func.count()).select_from(Job).where(Job.status == "failed",
-                                                                          Job.finished_at >= day_ago)) or 0,
-        avg_duration_sec=round(avg, 1) if avg else None,
-        workers=[QueueWorker(**w) for w in await temporal_client.workers()], jobs=jobs,
-    )
+    snap = await run_in_threadpool(queue_snapshot, db)
+    jobs = [job_out(j, *snap["places"].get(j.id, (None, None))) for j in snap["active"]]
+    return QueueOut(queued=snap["queued"], processing=snap["processing"], done_24h=snap["done_24h"],
+                    failed_24h=snap["failed_24h"], avg_duration_sec=snap["avg"],
+                    workers=[QueueWorker(**w) for w in await temporal_client.workers()], jobs=jobs)
 
 
 @router.get("/queue/jobs", response_model=list[JobOut], tags=["queue"])
@@ -683,17 +794,20 @@ def train_model() -> None:
 
 @router.post("/pipeline/rerun", response_model=PipelineOut, tags=["pipeline"])
 async def rerun_archive(db: Db) -> PipelineOut:
-    """Повторный анализ всех записей текущей моделью."""
+    """Повторный анализ всех записей текущей моделью — по одной записи, чтобы не задерживать видео жюри."""
     videos = db.scalars(select(Video).order_by(Video.uploaded_at)).all()
     run = PipelineRun(kind="rerun", status="running", total=len(videos))
     db.add(run)
     db.commit()
+    job_ids = []
     for video in videos:
         job = Job(id=uuid.uuid4().hex[:12], video_id=video.id, requested_by=f"rerun:{run.id}", stage="queued")
         db.add(job)
         db.commit()
         progress.set_stage(job.id, "queued", 0.0)
-        await temporal_client.start_analysis(job.id)
+        job_ids.append(job.id)
+    # по одной записи (RerunArchive): пересчёт держит один обработчик, остальные свободны для жюри
+    await temporal_client.start_rerun(run.id, job_ids)
     return pipeline(db)
 
 

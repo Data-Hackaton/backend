@@ -93,15 +93,27 @@
 
 ## API для жюри и ботов (раздел 10 ТЗ)
 
+Swagger с примерами и кнопкой **Authorize** (ключ один раз на всю страницу) — http://localhost:48000/docs, то же в ReDoc — `/redoc`.
+
 ```sh
 curl -X POST http://localhost:48000/api/v1/analyze -H "X-API-Key: $ADMIN_KEY" -F "file=@X-1.mov"
 # {"job_id":"3f2a9c1e0b7d"}
-curl http://localhost:48000/api/v1/jobs/3f2a9c1e0b7d -H "X-API-Key: $ADMIN_KEY"
+curl "http://localhost:48000/api/v1/jobs/3f2a9c1e0b7d?wait=30" -H "X-API-Key: $ADMIN_KEY"
 ```
+
+| Метод | Ключ | Что |
+|---|---|---|
+| `POST /api/v1/analyze` | да | видео `.mov` в поле `file` (до 200 МБ) → `{"job_id"}` |
+| `GET /api/v1/jobs/{job_id}` | да | статус и результат по схеме ТЗ; `?wait=0..60` — длинный опрос: ответ сразу по готовности; при `processing` — заголовок `Retry-After: 2` |
+| `GET /api/v1/jobs/{job_id}/progress` | да | `status` (`queued` / `processing` / `done` / `failed`), `stage`, `progress` 0–1, `queue_position`, `eta_sec`, время |
+| `GET /api/v1/jobs` | да | задачи этого ключа, новые сверху: `status`, `verdict`, число нарушений |
+| `GET /api/v1/health` | нет | `ok` / `degraded` (нет обработчика видео), воркеры по очередям, `queued`, `processing`, средняя длительность |
+
+Ошибки — `{"detail": "…"}`: `401` нет или неверный ключ, `404` нет задачи, `413` файл больше 200 МБ, `415` не `.mov` в поле `file`, `422` файл не читается как видео (и неверные параметры).
 
 Видео жюри и ботов хранятся, как и загрузки из интерфейса, и видны в `GET /videos` с `source: "api"` (из интерфейса — `upload`).
 
-`status`: `processing` (в очереди или в работе) → `done` | `failed`. При `done`: `verdict` (`violation` / `no_violation`) и `violations[]` — `type`, `timecode_sec`, `description` (что видно, почему это нарушение, косвенные и условные основания — «основание (косвенно): Правила №231, п.80», прямой норматив — «Норматив: … (url)»), `evidence_frames` (1–3 JPEG base64), сверх ТЗ — `rule` {`document`, `clause`, `url`} — только прямой норматив. Нормы — `data_prepare/reference/norms.yaml` поверх `norms_review.yaml` (аудит «Полной проверки ForteBank»). События одного типа ближе 5 с объединяются в одно нарушение. Задача, не уложившаяся в 4,5 мин, отдаётся как `failed`.
+`status`: `processing` (в очереди или в работе) → `done` | `failed`. При `done`: `verdict` (`violation` / `no_violation`) и `violations[]` — `type`, `timecode_sec`, `description` (что видно, почему это нарушение, косвенные и условные основания — «основание (косвенно): Правила №231, п.80», прямой норматив — «Норматив: … (url)»), `evidence_frames` (1–3 JPEG base64: первый — на таймкоде, затем за 1,5 с до и через 1,5 с после), сверх ТЗ — `rule` {`document`, `clause`, `url`} — только прямой норматив. Нормы — `data_prepare/reference/norms.yaml` поверх `norms_review.yaml` (аудит «Полной проверки ForteBank»). События одного типа ближе 5 с объединяются в одно нарушение. Задача, не уложившаяся в 4,5 мин, отдаётся как `failed`. Пересчёт архива из интерфейса идёт по одной записи (workflow `RerunArchive`) и держит не больше одного обработчика — видео жюри не ждут за ним в очереди.
 
 ## Запуск для разработки интерфейса
 

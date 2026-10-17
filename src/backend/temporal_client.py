@@ -25,6 +25,13 @@ async def start_analysis(job_id: str) -> None:
                            execution_timeout=timedelta(seconds=config.JOB_TIMEOUT_SEC))
 
 
+async def start_rerun(run_id: int, job_ids: list[str]) -> None:
+    """Пересчёт архива одним workflow: записи по одной, а не все разом в очередь cv-gpu."""
+    c = await client()
+    await c.start_workflow("RerunArchive", {"job_ids": job_ids, "timeout_sec": config.JOB_TIMEOUT_SEC},
+                           id=f"rerun-{run_id}", task_queue=config.ANALYZE_QUEUE)
+
+
 async def workers() -> list[dict]:
     """Кто сейчас слушает очереди: analyze (бэкенд) и cv-gpu (cv-worker)."""
     try:

@@ -32,7 +32,11 @@ def started(monkeypatch):
     async def workers():
         return [{"queue": "cv-gpu", "identity": "cv-worker@test", "last_seen": None}]
 
+    async def start_rerun(run_id, job_ids):  # пересчёт архива: задачи одной пачкой (RerunArchive)
+        jobs.extend(job_ids)
+
     monkeypatch.setattr(temporal_client, "start_analysis", start)
+    monkeypatch.setattr(temporal_client, "start_rerun", start_rerun)
     monkeypatch.setattr(temporal_client, "workers", workers)
     return jobs
 
@@ -267,3 +271,83 @@ def test_meta_and_cameras(client):
     meta = client.get("/api/v1/meta").json()
     assert [c["name"] for c in meta["classes"]] == ["person", "banknotes", "table"]
     assert meta["modes"] == ["view", "audit", "training"]
+
+
+def test_openapi_security_and_docs(client):
+    spec = client.get("/openapi.json").json()
+    schemes = spec["components"]["securitySchemes"]
+    assert schemes["X-API-Key"] == {"type": "apiKey", "in": "header", "name": "X-API-Key",
+                                    "description": schemes["X-API-Key"]["description"]}
+    assert schemes["Bearer"]["scheme"] == "bearer"
+    for path, method in (("/api/v1/analyze", "post"), ("/api/v1/jobs/{job_id}", "get"), ("/api/v1/jobs", "get")):
+        assert {"X-API-Key": []} in spec["paths"][path][method]["security"]
+    assert "security" not in spec["paths"]["/api/v1/health"]["get"]  # готовность — без ключа
+    assert spec["tags"][0]["name"] == "jury" and client.get("/docs").status_code == 200
+
+
+def test_jury_long_poll_and_retry_after(client, mov, s3):
+    import time
+
+    job_id = upload_api(client, mov).json()["job_id"]
+    t0 = time.monotonic()
+    r = client.get(f"/api/v1/jobs/{job_id}", params={"wait": 0.6}, headers=ADMIN)
+    assert r.json() == {"job_id": job_id, "status": "processing"} and time.monotonic() - t0 >= 0.5
+    assert r.headers["Retry-After"] == "2" and r.headers["Cache-Control"] == "no-store"
+    finish_job(s3, job_id, [], verdict="no_violation")
+    t0 = time.monotonic()
+    r = client.get(f"/api/v1/jobs/{job_id}", params={"wait": 30}, headers=ADMIN)
+    assert r.json()["status"] == "done" and time.monotonic() - t0 < 5 and "Retry-After" not in r.headers
+    assert client.get(f"/api/v1/jobs/{job_id}", params={"wait": 61}, headers=ADMIN).status_code == 422
+
+
+def test_progress_and_jobs_of_key(client, mov, s3):
+    job_id = upload_api(client, mov).json()["job_id"]
+    p = client.get(f"/api/v1/jobs/{job_id}/progress", headers=ADMIN).json()
+    assert (p["status"], p["stage"], p["queue_position"]) == ("queued", "queued", 1) and p["eta_sec"] > 0
+    assert client.get(f"/api/v1/jobs/{job_id}/progress").status_code == 401
+    assert client.get("/api/v1/jobs/nope/progress", headers=ADMIN).status_code == 404
+    finish_job(s3, job_id, [violation_event(1.0, job_id=job_id)])
+    p = client.get(f"/api/v1/jobs/{job_id}/progress", headers=ADMIN).json()
+    assert (p["status"], p["stage"], p["progress"], p["queue_position"]) == ("done", "done", 1.0, None)
+
+    token = client.post("/api/v1/tokens", json={"name": "bot"}).json()["token"]
+    bot_job = upload_api(client, mov, headers={"X-API-Key": token}).json()["job_id"]
+    mine = client.get("/api/v1/jobs", headers=ADMIN).json()
+    assert [(j["job_id"], j["status"], j["verdict"], j["violations"]) for j in mine] == [(job_id, "done", "violation", 1)]
+    assert [j["job_id"] for j in client.get("/api/v1/jobs", headers={"X-API-Key": token}).json()] == [bot_job]
+
+
+def test_health(client, monkeypatch):
+    h = client.get("/api/v1/health").json()
+    assert h["status"] == "ok" and h["workers"] == {"analyze": 0, "cv-gpu": 1}
+
+    async def no_workers():
+        return []
+
+    monkeypatch.setattr(temporal_client, "workers", no_workers)
+    assert client.get("/api/v1/health").json()["status"] == "degraded"
+
+
+def test_rerun_is_one_batch_and_waiting_jobs_do_not_expire(client, mov, s3, monkeypatch):
+    from datetime import timedelta
+
+    from backend.db import Job, SessionLocal
+
+    for _ in range(2):
+        with mov.open("rb") as f:
+            client.post("/api/v1/videos", files={"file": ("cam.mov", f)})
+    batches = []
+
+    async def start_rerun(run_id, job_ids):
+        batches.append(job_ids)
+
+    monkeypatch.setattr(temporal_client, "start_rerun", start_rerun)
+    client.post("/api/v1/pipeline/rerun")
+    assert len(batches) == 1 and len(batches[0]) == 2
+    with SessionLocal() as db:  # ждёт своей очереди дольше лимита — это не зависание
+        for job in db.query(Job).filter(Job.id.in_(batches[0])):
+            job.created_at = job.created_at - timedelta(minutes=30)
+        db.commit()
+    client.get("/api/v1/queue")
+    with SessionLocal() as db:
+        assert {j.status for j in db.query(Job).filter(Job.id.in_(batches[0]))} == {"queued"}
