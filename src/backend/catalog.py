@@ -120,6 +120,8 @@ def event_type_id(event: str, status: str, title: str | None, rules: list | None
     """type_id события модели или человека (у ручного события тип хранится в rules[0])."""
     if source == "human" and rules:
         return rules[0]
+    if event == "sop_step":  # SOP-чекер: название называет шаг («Пропущен шаг: …», «Не по порядку: …»)
+        return SOP_TYPES["Пропущен шаг процедуры"] if (title or "").startswith("Пропущен") else SOP_TYPES["Шаг процедуры не по порядку"]
     if title in SOP_TYPES:
         return SOP_TYPES[title]
     if status != "expected" and title:
