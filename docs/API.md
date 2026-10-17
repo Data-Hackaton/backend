@@ -101,7 +101,7 @@ curl http://localhost:48000/api/v1/jobs/3f2a9c1e0b7d -H "X-API-Key: $ADMIN_KEY"
 
 Видео жюри и ботов хранятся, как и загрузки из интерфейса, и видны в `GET /videos` с `source: "api"` (из интерфейса — `upload`).
 
-`status`: `processing` (в очереди или в работе) → `done` | `failed`. При `done`: `verdict` (`violation` / `no_violation`) и `violations[]` — `type`, `timecode_sec`, `description` (что видно + норматив), `evidence_frames` (1–3 JPEG base64), сверх ТЗ — `rule` {`document`, `clause`, `url`}. События одного типа ближе 5 с объединяются в одно нарушение. Задача, не уложившаяся в 4,5 мин, отдаётся как `failed`.
+`status`: `processing` (в очереди или в работе) → `done` | `failed`. При `done`: `verdict` (`violation` / `no_violation`) и `violations[]` — `type`, `timecode_sec`, `description` (что видно, почему это нарушение, косвенные и условные основания — «основание (косвенно): Правила №231, п.80», прямой норматив — «Норматив: … (url)»), `evidence_frames` (1–3 JPEG base64), сверх ТЗ — `rule` {`document`, `clause`, `url`} — только прямой норматив. Нормы — `data_prepare/reference/norms.yaml` поверх `norms_review.yaml` (аудит «Полной проверки ForteBank»). События одного типа ближе 5 с объединяются в одно нарушение. Задача, не уложившаяся в 4,5 мин, отдаётся как `failed`.
 
 ## Запуск для разработки интерфейса
 

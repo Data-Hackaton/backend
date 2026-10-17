@@ -27,6 +27,31 @@ def severity(inv: dict) -> str:
     return inv.get("severity") or ("violation" if inv.get("norm") else "warning")
 
 
+def load_norms() -> dict:
+    """Нормы: пункты из аудита (norms_review.yaml) и выверенные вручную norms.yaml поверх них — поля, которых в
+    ручной записи нет (requirement, limits), берутся из аудита."""
+    out: dict[str, dict] = {}
+    for name in ("norms_review.yaml", "norms.yaml"):
+        path = config.META_DIR / "reference" / name
+        for key, norm in ((yaml.safe_load(path.read_text()) or {}) if path.exists() else {}).items():
+            out[key] = {**out.get(key, {}), **norm}
+    return out
+
+
+def rule_description(inv: dict, norms: dict) -> str:
+    """Пояснение правила, требование прямого норматива и косвенные / условные основания — для каталога типов."""
+    parts = [why_text(inv.get("why"))]
+    norm = norms.get(inv.get("norm") or "")
+    if norm and norm.get("requirement"):
+        parts.append(f"Требование ({norm.get('short', inv['norm'])}): {norm['requirement']}")
+    by_relation: dict[str, list[str]] = {}
+    for b in inv.get("basis", []):
+        if b["norm"] in norms:
+            by_relation.setdefault(b["relation"], []).append(norms[b["norm"]].get("short", b["norm"]))
+    parts += [f"Основание ({rel}): {'; '.join(names)}" for rel, names in by_relation.items()]
+    return ". ".join(p.rstrip(".") for p in parts if p) + ("." if any(parts) else "")
+
+
 _SPEC: dict | None = None
 
 
@@ -44,6 +69,7 @@ def standard_types() -> list[dict]:
     rules = [inv for sc in s.get("scenarios", {}).values() for inv in sc.get("invariants", [])]
     rules += s.get("video_invariants", [])
     vocab = s.get("vocabulary", {}).get("actions", {})
+    norms = load_norms()
     out: dict[str, dict] = {}
     for inv in rules:
         title = inv.get("title")
@@ -56,7 +82,7 @@ def standard_types() -> list[dict]:
             continue
         action = inv.get("action") or inv.get("then") or {}
         name = action if isinstance(action, str) else action.get("action") if isinstance(action, dict) else None
-        out[tid] = {"id": tid, "title": title, "description": why_text(inv.get("why")),
+        out[tid] = {"id": tid, "title": title, "description": rule_description(inv, norms),
                     "observable": vocab.get(name, "") if name else "", "kind": severity(inv), "custom": False,
                     "status": "published", "samples": [], "norm": inv.get("norm")}
     for title, tid in SOP_TYPES.items():

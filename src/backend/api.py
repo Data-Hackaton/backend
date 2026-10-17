@@ -9,7 +9,6 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 
-import yaml
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response, StreamingResponse
@@ -36,9 +35,7 @@ def load_meta() -> dict:
     # классы боксов — только рамки; тег event (система событий в CVAT) — не класс
     labels = [label for label in json.loads((config.META_DIR / "cvat" / "labels.json").read_text())
               if label.get("type", "rectangle") != "tag"]
-    norms_path = config.META_DIR / "reference" / "norms.yaml"
-    norms = yaml.safe_load(norms_path.read_text()) if norms_path.exists() else {}
-    return {"labels": labels, "norms": norms}
+    return {"labels": labels, "norms": catalog.load_norms()}
 
 
 META: dict | None = None
