@@ -54,6 +54,7 @@ class Job(Base):
     error: Mapped[str | None] = mapped_column(Text)
     verdict: Mapped[str | None] = mapped_column(String(16))  # violation / no_violation
     detector: Mapped[str | None] = mapped_column(String(32))  # чем анализировали: stub, yolo, rfdetr
+    model: Mapped[str | None] = mapped_column(String(100))  # тег релиза модели (infra/model.sh); пусто — веса по умолчанию
     requested_by: Mapped[str] = mapped_column(String(100))  # ui / admin / имя токена
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=now, index=True)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
@@ -154,6 +155,7 @@ def init_db() -> None:
     if engine.dialect.name == "postgresql":
         with engine.begin() as conn:
             conn.exec_driver_sql("ALTER TABLE events ADD COLUMN IF NOT EXISTS source VARCHAR(16) NOT NULL DEFAULT 'model'")
+            conn.exec_driver_sql("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS model VARCHAR(100)")
     with engine.begin() as conn:  # отклонения без названного правила — не вопрос (activities.review_state)
         conn.exec_driver_sql("UPDATE events SET review = 'none' WHERE review = 'pending' AND source = 'model' "
                              "AND (title IS NULL OR event = 'sop_step')")

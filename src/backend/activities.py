@@ -53,9 +53,9 @@ def publish(result: dict) -> str:
             db.add(Box(video_id=job.video_id, job_id=job_id, t=b["t"], cls=b["cls"], x1=b["bbox"][0], y1=b["bbox"][1],
                        x2=b["bbox"][2], y2=b["bbox"][3], conf=b.get("conf"), track_id=b.get("track_id"),
                        attributes=b.get("attributes", {}),
-                       source="stub" if result.get("detector") == "stub" else "model"))  # имя модели — в job.detector
+                       source="stub" if result.get("detector") == "stub" else "model"))  # модель — в job.detector, job.model
         job.status, job.stage, job.verdict = "done", "done", result["verdict"]
-        job.detector, job.finished_at = result.get("detector"), now()
+        job.detector, job.model, job.finished_at = result.get("detector"), result.get("model"), now()
         db.commit()
     progress.set_stage(job_id, "done", 1.0)
     return result["verdict"]

@@ -753,7 +753,7 @@ def pipeline(db: Db) -> PipelineOut:
     last_done = db.scalar(select(Job).where(Job.status == "done").order_by(Job.finished_at.desc()).limit(1))
     out = PipelineOut(dataset_version=dataset.version if dataset else None,
                       dataset_stage=dataset.status if dataset else "idle",
-                      model_version=last_done.detector if last_done else None,
+                      model_version=(last_done.model or last_done.detector) if last_done else None,
                       total_videos=db.scalar(select(func.count()).select_from(Video)) or 0)
     if rerun:
         jobs = db.scalars(select(Job).where(Job.requested_by == f"rerun:{rerun.id}")).all()

@@ -184,10 +184,12 @@ def test_model_boxes_are_source_model(client, mov, s3):
                                                    "track_id": 1, "attributes": {"role": "cashier"}}]).encode()
     activities.prepare(job_id)
     activities.publish({"job_id": job_id, "verdict": "no_violation", "detector": "rfdetr",
+                        "model": "model-rfdetr-det_l1-20261017",
                         "events_key": f"jobs/{job_id}/events.json", "boxes_key": f"jobs/{job_id}/boxes.json"})
     boxes = client.get(f"/api/v1/videos/{video_id}/boxes").json()
     assert [(b["source"], b["track_id"], b["attributes"]) for b in boxes] == [("model", 1, {"role": "cashier"})]
     assert client.get(f"/api/v1/queue/jobs/{job_id}").json()["detector"] == "rfdetr"
+    assert client.get("/api/v1/pipeline").json()["model_version"] == "model-rfdetr-det_l1-20261017"
 
 
 def test_events_list_type_ids_and_manual_events(client, mov, s3):
