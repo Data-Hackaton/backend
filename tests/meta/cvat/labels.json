@@ -1,5 +1,19 @@
 [
-  {"name": "person", "attributes": []},
-  {"name": "banknotes", "attributes": []},
-  {"name": "table", "attributes": []}
+  {
+    "name": "person",
+    "attributes": []
+  },
+  {
+    "name": "banknotes",
+    "attributes": []
+  },
+  {
+    "name": "table",
+    "attributes": []
+  },
+  {
+    "name": "event",
+    "type": "tag",
+    "attributes": []
+  }
 ]

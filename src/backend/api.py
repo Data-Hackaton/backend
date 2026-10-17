@@ -33,7 +33,9 @@ VIOLATION_MERGE_SEC = 5.0  # события одного типа ближе 5 �
 # --- справочники ---------------------------------------------------------------------------------------------------
 
 def load_meta() -> dict:
-    labels = json.loads((config.META_DIR / "cvat" / "labels.json").read_text())
+    # классы боксов — только рамки; тег event (система событий в CVAT) — не класс
+    labels = [label for label in json.loads((config.META_DIR / "cvat" / "labels.json").read_text())
+              if label.get("type", "rectangle") != "tag"]
     norms_path = config.META_DIR / "reference" / "norms.yaml"
     norms = yaml.safe_load(norms_path.read_text()) if norms_path.exists() else {}
     return {"labels": labels, "norms": norms}

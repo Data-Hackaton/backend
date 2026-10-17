@@ -242,6 +242,16 @@ def test_pipeline_dataset_rerun_train(client, mov, s3, started):
     assert client.post("/api/v1/pipeline/train").status_code == 409
 
 
+def test_tag_label_is_not_a_box_class(client, mov, s3):
+    classes = [c["name"] for c in client.get("/api/v1/meta").json()["classes"]]
+    assert "event" not in classes and "person" in classes  # тег системы событий CVAT — не класс бокса
+    job_id = upload_api(client, mov).json()["job_id"]
+    video_id = client.get(f"/api/v1/queue/jobs/{job_id}").json()["video_id"]
+    finish_job(s3, job_id, [], verdict="no_violation")
+    bad = client.put(f"/api/v1/videos/{video_id}/boxes", params={"t": 1.0}, json=[{"cls": "event", "bbox": [0, 0, 5, 5]}])
+    assert bad.status_code == 422
+
+
 def test_meta_and_cameras(client):
     assert client.get("/api/v1/cameras").json() == {"items": [], "coming_soon": True}
     meta = client.get("/api/v1/meta").json()
