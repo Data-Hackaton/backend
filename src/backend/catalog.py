@@ -28,13 +28,30 @@ def severity(inv: dict) -> str:
 
 
 def load_norms() -> dict:
-    """Нормы: пункты из аудита (norms_review.yaml) и выверенные вручную norms.yaml поверх них — поля, которых в
-    ручной записи нет (requirement, limits), берутся из аудита."""
+    """Нормы: корпус (norms_corpus.yaml, полные тексты) → аудит пакета проверки (norms_review.yaml, требование и
+    границы применимости) → выверенные вручную norms.yaml; поля следующего файла поверх полей предыдущего."""
     out: dict[str, dict] = {}
-    for name in ("norms_review.yaml", "norms.yaml"):
+    for name in ("norms_corpus.yaml", "norms_review.yaml", "norms.yaml"):
         path = config.META_DIR / "reference" / name
         for key, norm in ((yaml.safe_load(path.read_text()) or {}) if path.exists() else {}).items():
             out[key] = {**out.get(key, {}), **norm}
+    return out
+
+
+def load_topics() -> dict:
+    path = config.META_DIR / "reference" / "topics.yaml"
+    return (yaml.safe_load(path.read_text()) or {}) if path.exists() else {}
+
+
+def procedures(inv: dict, topics: dict) -> list[dict]:
+    """Процедуры проверки темы (нормативный корпус): что проверить человеку, шаги с наблюдаемостью по видео."""
+    out = []
+    for tid in inv.get("topics", []):
+        t = topics.get(tid)
+        if t:
+            out.append({"id": tid, "title": t["title"], "check": t.get("check", []), "limits": t.get("limits"),
+                        "steps": [{"action": s["action"], "observability": s.get("observability")}
+                                  for s in t.get("steps", [])]})
     return out
 
 
@@ -69,22 +86,24 @@ def standard_types() -> list[dict]:
     rules = [inv for sc in s.get("scenarios", {}).values() for inv in sc.get("invariants", [])]
     rules += s.get("video_invariants", [])
     vocab = s.get("vocabulary", {}).get("actions", {})
-    norms = load_norms()
+    norms, topics = load_norms(), load_topics()
     out: dict[str, dict] = {}
     for inv in rules:
         title = inv.get("title")
         if not title:
             continue
         tid = rule_type_id(title)
-        if tid in out:  # одно правило в нескольких сценариях: самый строгий статус
+        if tid in out:  # одно правило в нескольких сценариях: самый строгий статус, процедуры всех сценариев
             if severity(inv) == "violation":
                 out[tid]["kind"] = "violation"
+            seen = {pr["id"] for pr in out[tid]["procedures"]}
+            out[tid]["procedures"] += [pr for pr in procedures(inv, topics) if pr["id"] not in seen]
             continue
         action = inv.get("action") or inv.get("then") or {}
         name = action if isinstance(action, str) else action.get("action") if isinstance(action, dict) else None
         out[tid] = {"id": tid, "title": title, "description": rule_description(inv, norms),
                     "observable": vocab.get(name, "") if name else "", "kind": severity(inv), "custom": False,
-                    "status": "published", "samples": [], "norm": inv.get("norm")}
+                    "status": "published", "samples": [], "norm": inv.get("norm"), "procedures": procedures(inv, topics)}
     for title, tid in SOP_TYPES.items():
         out[tid] = {"id": tid, "title": title, "description": "SOP-чекер: обязательный шаг цикла обслуживания "
                     "пропущен или идёт не по порядку", "observable": "", "kind": "warning", "custom": False,

@@ -1,0 +1,11 @@
+# Выдержка из reference/topics.yaml (data_prepare.corpus_import) для тестов каталога типов.
+previous_cash_storage:
+  title: Ранее принятые деньги остаются вне устройства хранения
+  steps:
+  - action: Хранить ранее принятые деньги в специальном устройстве, закрывающемся на ключ.
+    kind: required_action
+    observability: partly_observable
+    norms: [n231_p20]
+  check: [Принадлежность денег прежней операции, Стадия операции]
+  limits: Деньги текущего клиента на столе допустимы.
+  norms: [n231_p20]

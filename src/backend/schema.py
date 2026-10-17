@@ -164,6 +164,20 @@ class EventTypeIn(BaseModel):
     first_sample: SampleIn
 
 
+class ProcedureStep(BaseModel):
+    action: str
+    observability: str | None = None  # partly_observable / context_required / not_visually_verifiable
+
+
+class Procedure(BaseModel):
+    """Процедура проверки темы из нормативного корпуса (reference/topics.yaml)."""
+    id: str
+    title: str
+    check: list[str] = []  # что установить человеку
+    limits: str | None = None  # исключения и границы вывода
+    steps: list[ProcedureStep] = []
+
+
 class EventTypeOut(BaseModel):
     id: str
     title: str
@@ -174,6 +188,7 @@ class EventTypeOut(BaseModel):
     status: Literal["published", "draft"]
     samples: list[SampleOut] = []
     norm: str | None = None
+    procedures: list[Procedure] = []
 
 
 class SampleReviewIn(BaseModel):

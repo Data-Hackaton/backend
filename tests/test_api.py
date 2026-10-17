@@ -197,6 +197,8 @@ def test_events_list_type_ids_and_manual_events(client, mov, s3):
     carry = next(e for e in events if e["status"] == "violation")
     assert types[carry["type_id"]]["title"] == "Деньги предыдущего клиента на кассовом столе"
     assert types[carry["type_id"]]["kind"] == "violation" and types["step:person_enter"]["kind"] == "expected"
+    procedure = types[carry["type_id"]]["procedures"][0]  # процедура проверки темы из нормативного корпуса
+    assert procedure["id"] == "previous_cash_storage" and procedure["check"] and procedure["steps"][0]["observability"]
 
     personal = next(t["id"] for t in types.values() if t["title"] == "Личные вещи на кассовом столе")
     body = {"video_id": video_id, "type_id": personal, "start": 1.0, "end": 2.0, "description": "сумка на столе"}

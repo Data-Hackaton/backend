@@ -10,4 +10,4 @@ scenarios:
     invariants:
       - {title: Личные вещи на кассовом столе, kind: forbidden, action: {action: put, object: foreign_object, target: desk}, norm: n231_p12, why: личные вещи хранятся вне кассового узла (X-40)}
 video_invariants:
-  - {kind: desk_carryover, title: Деньги предыдущего клиента на кассовом столе, object: banknotes, triggers: [], norm: n231_p20, why: на рабочем месте только деньги текущего клиента}
+  - {kind: desk_carryover, title: Деньги предыдущего клиента на кассовом столе, object: banknotes, triggers: [], norm: n231_p20, topics: [previous_cash_storage], why: на рабочем месте только деньги текущего клиента}
