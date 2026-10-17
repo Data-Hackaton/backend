@@ -20,6 +20,13 @@ def prepare(job_id: str) -> dict:
                 "duration": video.duration, "fps": video.fps, "width": video.width, "height": video.height}
 
 
+def review_state(e: dict) -> str:
+    """В очередь «Требует внимания» — только сработавшее названное правило (L3 или SOP-чекер). Шаг процедуры и
+    отклонение от шаблона без названия (out_of_template, order) остаются на таймлайне, но вопросом не считаются:
+    по шумному журналу детектора это чаще нормальное поведение."""
+    return "pending" if e["status"] != "expected" and e.get("title") else "none"
+
+
 @activity.defn(name="publish")
 def publish(result: dict) -> str:
     """result от run_cv: {job_id, verdict, detector, events_key, boxes_key}; события и боксы лежат в S3."""
@@ -36,7 +43,7 @@ def publish(result: dict) -> str:
                 actor=e.get("actor"), object=e.get("object"), target=e.get("target"), scenario=e.get("scenario"),
                 instance=e.get("instance"), step=e.get("step"), status=e["status"], title=e.get("title"),
                 rules=e.get("rules", []), norm=e.get("norm"), message=e.get("message"), evidence=e.get("evidence", []),
-                review="none" if e["status"] == "expected" else "pending",
+                review=review_state(e),
             ))
         # боксы модели прошлых прогонов этого видео заменяются, правки человека остаются
         db.query(Box).filter(Box.video_id == job.video_id, Box.source != "human").delete()
