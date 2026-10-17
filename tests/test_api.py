@@ -3,6 +3,7 @@ import json
 import subprocess
 
 import pytest
+from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 
 from backend import activities, storage, temporal_client
@@ -353,3 +354,16 @@ def test_rerun_is_one_batch_and_waiting_jobs_do_not_expire(client, mov, s3, monk
     client.get("/api/v1/queue")
     with SessionLocal() as db:
         assert {j.status for j in db.query(Job).filter(Job.id.in_(batches[0]))} == {"queued"}
+
+
+def test_stream_releases_db_and_missing_object_is_404(client, mov, s3, monkeypatch):
+    job_id = upload_api(client, mov).json()["job_id"]
+    video_id = client.get(f"/api/v1/queue/jobs/{job_id}").json()["video_id"]
+    monkeypatch.setattr(storage, "stream", lambda key, rng: (iter([b"abc"]), {"Content-Length": "3"}, 200))
+    assert client.get(f"/api/v1/videos/{video_id}/stream").content == b"abc"
+
+    def missing(key, rng):  # объект ещё не в S3 (перенос бакета): плееру — 404, а не 500
+        raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+
+    monkeypatch.setattr(storage, "stream", missing)
+    assert client.get(f"/api/v1/videos/{video_id}/stream").status_code == 404

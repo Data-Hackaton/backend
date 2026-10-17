@@ -11,6 +11,7 @@ from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Annotated
 
+from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response, StreamingResponse
@@ -381,7 +382,15 @@ def get_video(video_id: str, db: Db) -> VideoOut:
 @router.get("/videos/{video_id}/stream", tags=["videos"])
 def stream_video(video_id: str, request: Request, db: Db) -> StreamingResponse:
     video = _video(db, video_id)
-    body, headers, status = storage.stream(video.play_key or video.source_key, request.headers.get("range"))
+    key = video.play_key or video.source_key
+    # стрим через туннель идёт минутами: соединение с БД — сразу в пул, а не после ответа (иначе пул кончается)
+    db.close()
+    try:
+        body, headers, status = storage.stream(key, request.headers.get("range"))
+    except ClientError as e:
+        if e.response["Error"]["Code"] in ("NoSuchKey", "404"):
+            raise HTTPException(status_code=404, detail="video file not found") from e
+        raise
     return StreamingResponse(body, status_code=status, headers=headers, media_type="video/mp4")
 
 
@@ -389,7 +398,9 @@ def stream_video(video_id: str, request: Request, db: Db) -> StreamingResponse:
 def video_frame(video_id: str, db: Db, t: Annotated[float, Query(ge=0)] = 0.0) -> Response:
     """JPEG кадра на момент t — подложка редактора боксов."""
     video = _video(db, video_id)
-    data = media.frame_jpeg(storage.presign(video.play_key or video.source_key), t)
+    key = video.play_key or video.source_key
+    db.close()  # ffmpeg читает видео из S3 секундами — соединение с БД ему не нужно
+    data = media.frame_jpeg(storage.presign(key), t)
     if not data:
         raise HTTPException(status_code=416, detail="t outside the video")
     return Response(content=data, media_type="image/jpeg")
