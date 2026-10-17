@@ -38,9 +38,10 @@ def remux_mp4(src: Path, dst: Path) -> None:
 
 
 def frame_jpeg(url: str, t: float) -> bytes:
+    """JPEG кадра на момент t; пусто, если кадра нет (t за концом видео — ffmpeg завершается с ошибкой)."""
     out = subprocess.run(
         ["ffmpeg", "-v", "error", "-ss", f"{max(t, 0):.3f}", "-i", url, "-frames:v", "1",
          "-f", "image2pipe", "-vcodec", "mjpeg", "-q:v", "3", "-"],
-        capture_output=True, check=True,
+        capture_output=True,
     )
-    return out.stdout
+    return out.stdout if out.returncode == 0 else b""
