@@ -4,8 +4,13 @@
 
 ## Доступ
 
-- **Интерфейс — без авторизации**: все методы, кроме двух методов ботов/жюри, открыты.
-- **Боты и жюри** (`POST /analyze`, `GET /jobs/{id}`) — ключ в заголовке `X-API-Key: <ключ>` или `Authorization: Bearer <ключ>`. Подходит мастер-ключ `ADMIN_KEY` (из `infra/.env`, через UI не отзывается) или токен, выпущенный в интерфейсе. Без ключа — `401`.
+- Рабочие методы, поток видео, кадры и документация требуют общий `ADMIN_KEY` либо браузерную сессию. Без доступа — `401`; неверный заголовок не заменяется существующей cookie.
+- API принимает `X-API-Key: <ключ>` или `Authorization: Bearer <ключ>`. Ключ задан в локальном `infra/docker-compose.override.yml`; токены ботов больше не принимаются.
+- `POST /auth/session` с JSON `{"token":"…"}` устанавливает подписанную HttpOnly cookie на 12 часов. Требуется `Origin` текущего сайта. Токен не сохраняется в браузерном хранилище.
+- `GET /auth/session` → `{"authenticated":true,"expires_at":<Unix seconds>}`; без сессии — `false`, `null`. Для доступа по API-заголовку срок отсутствует (`null`).
+- `DELETE /auth/session` удаляет cookie (`204`). Изменяющие запросы с cookie требуют совпадающий `Origin`. Смена `ADMIN_KEY` аннулирует все сессии.
+- `SESSION_COOKIE_SECURE=true` обязателен на HTTPS-развёртывании; `false` предусмотрен для локального HTTP. Ответы API и медиа — `Cache-Control: no-store`.
+- Без ключа доступны `/healthz`, `/api/v1/health`, методы сессии и статическая оболочка входа. Презентация и её подготовленные материалы публичны на gateway.
 
 ## Экраны → методы
 
@@ -75,13 +80,14 @@
 
 Боксы модели приходят на кадрах с шагом ~0,5 с; для плавного показа поверх видео брать ближайший кадр по времени. Классы и атрибуты (цвета, `state`, `kind`, `screen`) — `GET /meta` → `classes`. Служебные классы: `ignore_zone` — стекло, всё внутри игнорируется; `reflection` — человек в отражении.
 
-### Токены ботов
+### Токены ботов — Coming soon
 
-| Метод | Что |
+| Метод | Ответ после авторизации |
 |---|---|
-| `GET /tokens` | `[{id, name, prefix, created_at, last_used_at, revoked_at}]` — сам токен не хранится |
-| `POST /tokens` | `{"name": "telegram-bot"}` → то же + `token` — **показать один раз** |
-| `DELETE /tokens/{id}` | отозвать |
+| `GET /tokens` | `{"items":[],"coming_soon":true}` |
+| `POST /tokens`, `DELETE /tokens/{id}` | `501`, сообщение Coming soon; без изменений БД |
+
+Ранее созданные токены остаются в БД, но не дают доступа.
 
 ### Камеры и справочники
 
@@ -93,7 +99,7 @@
 
 ## API для жюри и ботов (раздел 10 ТЗ)
 
-Swagger с примерами и кнопкой **Authorize** (ключ один раз на всю страницу) — http://localhost:48000/docs, то же в ReDoc — `/redoc`.
+После входа на `/` доступны Swagger с примерами и кнопкой **Authorize** (ключ один раз на всю страницу) — http://localhost:48000/docs, то же в ReDoc — `/redoc`.
 
 ```sh
 curl -X POST http://localhost:48000/api/v1/analyze -H "X-API-Key: $ADMIN_KEY" -F "file=@X-1.mov"
@@ -119,7 +125,7 @@ curl "http://localhost:48000/api/v1/jobs/3f2a9c1e0b7d?wait=30" -H "X-API-Key: $A
 
 ```sh
 cd infra
-echo "ADMIN_KEY=$(openssl rand -hex 24)" >> .env      # один раз
+./init-access.py                                  # один раз; --https для публичного HTTPS
 docker compose --profile tools build cv               # образ cv-worker (torch, ~10 ГБ)
 docker compose --profile app up -d                    # postgres, backend, worker, cv-worker + Temporal, S3, Valkey
 ```

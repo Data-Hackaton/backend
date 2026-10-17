@@ -1,12 +1,13 @@
 # backend
 
-FastAPI: API для жюри (раздел 10 ТЗ) и раздача сборки `frontend`. Сейчас обработка — мок: через 3 секунды задача отдаёт одно «нарушение» с кадром из середины видео. Следующий шаг — workflow `AnalyzeVideo` в Temporal (схема в `infra/README.md`).
+FastAPI: API для жюри (раздел 10 ТЗ) и раздача сборки `frontend`. Обработка запускается через workflow `AnalyzeVideo` в Temporal; результат публикует CV worker (схема в `infra/README.md`).
 
 ## Запуск
 
 ```sh
 uv sync
-API_KEY=$(openssl rand -hex 24) uv run backend      # http://127.0.0.1:8000, docs: /docs
+export ADMIN_KEY="$(openssl rand -hex 24)"
+uv run backend      # http://127.0.0.1:8000, docs: /docs
 uv run pytest
 ```
 
@@ -14,17 +15,20 @@ uv run pytest
 
 | Переменная | По умолчанию | Что |
 |---|---|---|
-| `API_KEY` | пусто → все запросы 401 | ключ для заголовка `X-API-Key` |
+| `ADMIN_KEY` | обязателен, иначе запуск прерывается | общий токен для интерфейса, `X-API-Key` и Bearer |
+| `SESSION_COOKIE_SECURE` | false (локальный HTTP) | true для публичного HTTPS |
 | `MAX_UPLOAD_MB` | 200 | лимит размера видео |
 | `FRONTEND_DIST` | `../frontend/dist` | если каталог есть, отдаётся на `/` |
 | `HOST`, `PORT` | 127.0.0.1, 8000 | |
 
+Compose: `../infra/init-access.py` переносит существующий ключ из `.env` в игнорируемый Git локальный override. Для HTTPS используйте `--https`. В интерфейсе одно поле токена; доступ сохраняется в подписанной cookie на 12 часов. `/docs` открывается после входа. Токены ботов — Coming soon. Подробнее: [контракт API](docs/API.md).
+
 ## API
 
 ```sh
-curl -X POST http://127.0.0.1:8000/api/v1/analyze -H "X-API-Key: $API_KEY" -F "file=@video.mov"
+curl -X POST http://127.0.0.1:8000/api/v1/analyze -H "X-API-Key: $ADMIN_KEY" -F "file=@video.mov"
 # {"job_id":"3f2a9c1e0b7d"}
-curl http://127.0.0.1:8000/api/v1/jobs/3f2a9c1e0b7d -H "X-API-Key: $API_KEY"
+curl http://127.0.0.1:8000/api/v1/jobs/3f2a9c1e0b7d -H "X-API-Key: $ADMIN_KEY"
 ```
 
 - `status`: `processing` → `done` | `failed`. При `done` есть `verdict` (`violation` / `no_violation`) и `violations`.

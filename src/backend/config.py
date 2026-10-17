@@ -3,7 +3,8 @@
 import os
 from pathlib import Path
 
-ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # мастер-ключ ботов и жюри, через UI не отзывается
+ADMIN_KEY = os.environ.get("ADMIN_KEY", "")  # общий ключ: локальный Compose override или окружение
+SESSION_COOKIE_SECURE = os.environ.get("SESSION_COOKIE_SECURE", "false").lower() == "true"
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///./dev.db")
 
 S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "http://localhost:48333")

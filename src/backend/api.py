@@ -1,4 +1,4 @@
-"""Маршруты /api/v1: API жюри и ботов (по ключу) и методы интерфейса (открыты). Контракт — docs/API.md."""
+"""Маршруты /api/v1: API жюри и интерфейса (по общему ключу или сессии). Контракт — docs/API.md."""
 
 import asyncio
 import base64
@@ -15,24 +15,58 @@ from botocore.exceptions import ClientError
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Request, UploadFile
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, SecretStr
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from backend import catalog, config, media, progress, storage, temporal_client
-from backend.auth import hash_token, new_token, require_key
+from backend.auth import (COOKIE_NAME, SESSION_SECONDS, authentication, new_session, require_key,
+                          require_same_origin, session_expiry, valid_key)
 from backend.db import (
-    ApiToken, Box, Event, EventSample, EventType, Job, PipelineRun, SessionLocal, Video, get_db, now,
+    Box, Event, EventSample, EventType, Job, PipelineRun, SessionLocal, Video, get_db, now,
 )
 from backend.schema import (
     AnalyzeResponse, BoxIn, BoxOut, CalendarDay, ErrorOut, EventOut, EventTypeIn, EventTypeOut, EvidenceFrame,
     HealthOut, JobOut, JobProgress, JobResponse, JobSummary, ManualEventIn, PipelineOut, QueueOut, QueueWorker,
-    ReviewIn, Rule, SampleIn, SampleOut, SampleReviewIn, TokenCreated, TokenIn, TokenOut, UploadOut, VideoOut,
+    ReviewIn, Rule, SampleIn, SampleOut, SampleReviewIn, UploadOut, VideoOut,
     Violation,
 )
 
-router = APIRouter(prefix="/api/v1")
+router = APIRouter(prefix="/api/v1", dependencies=[Depends(require_key)])
+public_router = APIRouter(prefix="/api/v1")
 Db = Annotated[Session, Depends(get_db)]
 VIOLATION_MERGE_SEC = 5.0  # события одного типа ближе 5 с — один эпизод нарушения
+
+
+# --- доступ -------------------------------------------------------------------------------------------------------
+
+class SessionInput(BaseModel):
+    token: SecretStr
+
+
+@public_router.get("/auth/session", tags=["access"])
+def session_status(request: Request) -> dict:
+    return {"authenticated": authentication(request) is not None, "expires_at": session_expiry(request)}
+
+
+@public_router.post("/auth/session", tags=["access"], status_code=204)
+def login(body: SessionInput, request: Request) -> Response:
+    require_same_origin(request)
+    if not valid_key(body.token.get_secret_value()):
+        raise HTTPException(status_code=401, detail="Неверный токен доступа. Проверьте его и попробуйте снова.")
+    response = Response(status_code=204)
+    response.set_cookie(COOKIE_NAME, new_session(), max_age=SESSION_SECONDS, path="/",
+                        httponly=True, secure=config.SESSION_COOKIE_SECURE, samesite="strict")
+    return response
+
+
+@public_router.delete("/auth/session", tags=["access"], status_code=204)
+def logout(request: Request) -> Response:
+    require_same_origin(request)
+    response = Response(status_code=204)
+    response.delete_cookie(COOKIE_NAME, path="/", httponly=True,
+                           secure=config.SESSION_COOKIE_SECURE, samesite="strict")
+    return response
 
 
 # --- справочники ---------------------------------------------------------------------------------------------------
@@ -322,7 +356,7 @@ def my_jobs(db: Db, who: Annotated[str, Depends(require_key)],
     return out
 
 
-@router.get("/health", response_model=HealthOut, tags=["jury"], summary="Готовность сервиса")
+@public_router.get("/health", response_model=HealthOut, tags=["jury"], summary="Готовность сервиса")
 async def health(db: Db) -> HealthOut:
     """Без ключа: слушают ли очереди обработчики и сколько задач ждёт. `degraded` — видео сейчас не обработается."""
     snap = await run_in_threadpool(queue_snapshot, db)
@@ -642,33 +676,15 @@ def training_export(db: Db) -> dict:
 
 # --- токены ботов --------------------------------------------------------------------------------------------------
 
-def token_out(t: ApiToken) -> TokenOut:
-    return TokenOut(id=t.id, name=t.name, prefix=t.prefix, created_at=t.created_at, last_used_at=t.last_used_at,
-                    revoked_at=t.revoked_at)
+@router.get("/tokens", tags=["tokens"])
+def list_tokens() -> dict:
+    return {"items": [], "coming_soon": True}
 
 
-@router.get("/tokens", response_model=list[TokenOut], tags=["tokens"])
-def list_tokens(db: Db) -> list[TokenOut]:
-    return [token_out(t) for t in db.scalars(select(ApiToken).order_by(ApiToken.created_at.desc())).all()]
-
-
-@router.post("/tokens", response_model=TokenCreated, tags=["tokens"])
-def create_token(body: TokenIn, db: Db) -> TokenCreated:
-    secret = new_token()
-    token = ApiToken(name=body.name, prefix=secret[:12], token_hash=hash_token(secret))
-    db.add(token)
-    db.commit()
-    return TokenCreated(**token_out(token).model_dump(), token=secret)
-
-
-@router.delete("/tokens/{token_id}", response_model=TokenOut, tags=["tokens"])
-def revoke_token(token_id: int, db: Db) -> TokenOut:
-    token = db.get(ApiToken, token_id)
-    if token is None:
-        raise HTTPException(status_code=404, detail="token not found")
-    token.revoked_at = token.revoked_at or now()
-    db.commit()
-    return token_out(token)
+@router.post("/tokens", tags=["tokens"], status_code=501)
+@router.delete("/tokens/{token_id}", tags=["tokens"], status_code=501)
+def tokens_coming_soon() -> None:
+    raise HTTPException(status_code=501, detail="Coming soon — токены ботов пока недоступны")
 
 
 # --- типы событий: стандартные и собственные ------------------------------------------------------------------------

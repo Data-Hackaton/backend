@@ -46,7 +46,7 @@ def started(monkeypatch):
 def client(s3, started):
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
-    with TestClient(app) as c:
+    with TestClient(app, headers=ADMIN) as c:
         yield c
 
 
@@ -80,9 +80,9 @@ def violation_event(t, title="Деньги предыдущего клиента
 
 
 def test_jury_requires_key(client, mov):
-    assert upload_api(client, mov, headers={}).status_code == 401
+    assert upload_api(client, mov, headers={"X-API-Key": ""}).status_code == 401
     assert upload_api(client, mov, headers={"X-API-Key": "wrong"}).status_code == 401
-    assert client.get("/api/v1/jobs/nope").status_code == 401
+    assert client.get("/api/v1/jobs/nope", headers={"X-API-Key": ""}).status_code == 401
 
 
 def test_jury_only_mov(client, tmp_path):
@@ -90,15 +90,10 @@ def test_jury_only_mov(client, tmp_path):
     assert r.status_code == 415
 
 
-def test_tokens_issue_use_revoke(client, mov):
-    created = client.post("/api/v1/tokens", json={"name": "bot-1"}).json()
-    secret = created["token"]
-    assert secret.startswith("fva_") and created["prefix"] == secret[:12]
-    assert "token" not in client.get("/api/v1/tokens").json()[0]
-    assert upload_api(client, mov, headers={"Authorization": f"Bearer {secret}"}).status_code == 200
-    assert client.get("/api/v1/tokens").json()[0]["last_used_at"] is not None
-    client.delete(f"/api/v1/tokens/{created['id']}")
-    assert upload_api(client, mov, headers={"X-API-Key": secret}).status_code == 401
+def test_tokens_coming_soon(client):
+    assert client.get("/api/v1/tokens").json() == {"items": [], "coming_soon": True}
+    assert client.post("/api/v1/tokens", json={"name": "bot-1"}).status_code == 501
+    assert client.delete("/api/v1/tokens/1").status_code == 501
 
 
 def test_analyze_then_done_in_jury_schema(client, mov, s3, started):
@@ -307,17 +302,14 @@ def test_progress_and_jobs_of_key(client, mov, s3):
     job_id = upload_api(client, mov).json()["job_id"]
     p = client.get(f"/api/v1/jobs/{job_id}/progress", headers=ADMIN).json()
     assert (p["status"], p["stage"], p["queue_position"]) == ("queued", "queued", 1) and p["eta_sec"] > 0
-    assert client.get(f"/api/v1/jobs/{job_id}/progress").status_code == 401
+    assert client.get(f"/api/v1/jobs/{job_id}/progress", headers={"X-API-Key": ""}).status_code == 401
     assert client.get("/api/v1/jobs/nope/progress", headers=ADMIN).status_code == 404
     finish_job(s3, job_id, [violation_event(1.0, job_id=job_id)])
     p = client.get(f"/api/v1/jobs/{job_id}/progress", headers=ADMIN).json()
     assert (p["status"], p["stage"], p["progress"], p["queue_position"]) == ("done", "done", 1.0, None)
 
-    token = client.post("/api/v1/tokens", json={"name": "bot"}).json()["token"]
-    bot_job = upload_api(client, mov, headers={"X-API-Key": token}).json()["job_id"]
     mine = client.get("/api/v1/jobs", headers=ADMIN).json()
     assert [(j["job_id"], j["status"], j["verdict"], j["violations"]) for j in mine] == [(job_id, "done", "violation", 1)]
-    assert [j["job_id"] for j in client.get("/api/v1/jobs", headers={"X-API-Key": token}).json()] == [bot_job]
 
 
 def test_health(client, monkeypatch):

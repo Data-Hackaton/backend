@@ -6,12 +6,15 @@ from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
 from backend import config, storage
-from backend.api import router
+from backend.api import public_router, router
+from backend.auth import AccessMiddleware
 from backend.db import init_db
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if not config.ADMIN_KEY.strip():
+        raise RuntimeError("ADMIN_KEY is required: configure the local Compose override or environment")
     init_db()
     try:
         storage.ensure_bucket()
@@ -47,7 +50,8 @@ curl "http://localhost:48000/api/v1/jobs/<job_id>?wait=30" -H "X-API-Key: <кл�
 **Коды ошибок:** `401` — нет ключа или ключ неверный, `404` — нет задачи, `413` — файл больше 200 МБ,
 `415` — не `.mov` в поле `file`, `422` — файл не читается как видео. Тело ошибки — `{"detail": "…"}`.
 
-Остальные методы — для веб-интерфейса (открыты). Описание контракта — также в `/redoc`.
+Остальные методы, видео и кадры также требуют ключ или браузерную сессию. Токены ботов — Coming soon.
+Описание контракта — также в `/redoc` (после входа).
 """
 TAGS = [
     {"name": "jury", "description": "API жюри и ботов: загрузка видео, статус и результат, ход обработки. По ключу."},
@@ -56,15 +60,18 @@ TAGS = [
     {"name": "events", "description": "События записи, очередь «Требует внимания», решения проверяющего."},
     {"name": "boxes", "description": "Рамки объектов: вывод модели и правки человека."},
     {"name": "event-types", "description": "Каталог типов событий и собственные типы с примерами."},
-    {"name": "tokens", "description": "Токены для ботов и интеграций."},
+    {"name": "tokens", "description": "Coming soon — токены ботов пока недоступны."},
+    {"name": "access", "description": "Вход по общему токену доступа."},
     {"name": "pipeline", "description": "Сборка набора, дообучение, пересчёт архива."},
     {"name": "meta", "description": "Справочники интерфейса."},
 ]
 app = FastAPI(title="Forte Видеоаудит — API", version="1.1", description=DESCRIPTION, openapi_tags=TAGS,
               lifespan=lifespan,
-              swagger_ui_parameters={"persistAuthorization": True, "displayRequestDuration": True,
+              swagger_ui_parameters={"persistAuthorization": False, "displayRequestDuration": True,
                                      "tryItOutEnabled": True, "defaultModelsExpandDepth": 0})
+app.include_router(public_router)
 app.include_router(router)
+app.add_middleware(AccessMiddleware)
 
 
 @app.get("/healthz", include_in_schema=False)

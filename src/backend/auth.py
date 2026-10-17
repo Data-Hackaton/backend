@@ -1,50 +1,120 @@
-"""Ключи доступа для ботов и жюри: мастер-ключ ADMIN_KEY из env + токены, выпущенные в UI.
+"""Shared access key for the API and a short-lived signed browser session."""
 
-Ключ передаётся в X-API-Key (как требует ТЗ) или в Authorization: Bearer. В БД хранится только sha256 токена.
-Методы интерфейса открыты (решение команды на время хакатона), ключ нужен только API для ботов и жюри.
-"""
-
-import hashlib
 import secrets
 from typing import Annotated
+from urllib.parse import urlsplit
 
-from fastapi import Depends, HTTPException, Security
-from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from fastapi import HTTPException, Request, Security
+from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyCookie, APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer
+from itsdangerous import BadSignature, URLSafeTimedSerializer
+from starlette.datastructures import MutableHeaders
 
 from backend import config
-from backend.db import ApiToken, get_db, now
 
-TOKEN_PREFIX = "fva_"
-# схемы безопасности OpenAPI: в /docs кнопка Authorize подставляет ключ во все методы жюри
+COOKIE_NAME = "fva_session"
+SESSION_SECONDS = 12 * 60 * 60
 API_KEY = APIKeyHeader(name="X-API-Key", scheme_name="X-API-Key", auto_error=False,
-                       description="Ключ жюри (выдаёт команда) или токен бота из интерфейса")
-BEARER = HTTPBearer(scheme_name="Bearer", auto_error=False, description="Тот же ключ в Authorization: Bearer <ключ>")
+                       description="Общий ключ доступа ADMIN_KEY")
+BEARER = HTTPBearer(scheme_name="Bearer", auto_error=False, description="Общий ключ доступа")
+COOKIE = APIKeyCookie(name=COOKIE_NAME, scheme_name="BrowserSession", auto_error=False)
 
 
-def hash_token(token: str) -> str:
-    return hashlib.sha256(token.encode()).hexdigest()
+def valid_key(key: str | None) -> bool:
+    return bool(key and config.ADMIN_KEY and secrets.compare_digest(key.encode(), config.ADMIN_KEY.encode()))
 
 
-def new_token() -> str:
-    return TOKEN_PREFIX + secrets.token_urlsafe(32)
+def signer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(config.ADMIN_KEY, salt="forte-browser-session-v1")
+
+
+def new_session() -> str:
+    return signer().dumps({"access": "admin", "nonce": secrets.token_urlsafe(16)})
+
+
+def valid_session(value: str | None) -> bool:
+    if not value or not config.ADMIN_KEY:
+        return False
+    try:
+        data = signer().loads(value, max_age=SESSION_SECONDS)
+        return isinstance(data, dict) and data.get("access") == "admin"
+    except BadSignature:
+        return False
+
+
+def session_expiry(request: Request) -> int | None:
+    if request.headers.get("x-api-key") is not None or request.headers.get("authorization") is not None:
+        return None
+    if not valid_session(request.cookies.get(COOKIE_NAME)):
+        return None
+    _, issued = signer().loads(request.cookies[COOKIE_NAME], max_age=SESSION_SECONDS, return_timestamp=True)
+    return int(issued.timestamp()) + SESSION_SECONDS
+
+
+def authentication(request: Request) -> str | None:
+    """Explicit bad credentials never fall back to an existing browser cookie."""
+    key = request.headers.get("x-api-key")
+    authorization = request.headers.get("authorization")
+    if key is not None:
+        return "key" if valid_key(key) else None
+    if authorization is not None:
+        scheme, _, value = authorization.partition(" ")
+        return "key" if scheme.lower() == "bearer" and valid_key(value) else None
+    return "cookie" if valid_session(request.cookies.get(COOKIE_NAME)) else None
+
+
+def require_same_origin(request: Request) -> None:
+    """Cookie writes need a browser Origin matching the externally visible host/scheme."""
+    origin = request.headers.get("origin")
+    expected_scheme = "https" if config.SESSION_COOKIE_SECURE else request.url.scheme
+    try:
+        parsed = urlsplit(origin or "")
+        same = (parsed.scheme == expected_scheme and parsed.netloc.lower() == request.headers.get("host", "").lower()
+                and not parsed.path and not parsed.query and not parsed.fragment)
+    except ValueError:
+        same = False
+    if not same or request.headers.get("sec-fetch-site") == "cross-site":
+        raise HTTPException(status_code=403, detail="Запрос должен исходить с этого сайта")
 
 
 def require_key(
-    db: Annotated[Session, Depends(get_db)],
+    request: Request,
     x_api_key: Annotated[str | None, Security(API_KEY)] = None,
     bearer: Annotated[HTTPAuthorizationCredentials | None, Security(BEARER)] = None,
+    session: Annotated[str | None, Security(COOKIE)] = None,
 ) -> str:
-    """Имя того, кто пришёл: admin или имя токена; иначе 401."""
-    key = x_api_key or (bearer.credentials if bearer else None)
-    if not key:
-        raise HTTPException(status_code=401, detail="missing X-API-Key")
-    if config.ADMIN_KEY and secrets.compare_digest(key, config.ADMIN_KEY):
-        return "admin"
-    token = db.scalar(select(ApiToken).where(ApiToken.token_hash == hash_token(key), ApiToken.revoked_at.is_(None)))
-    if token is None:
-        raise HTTPException(status_code=401, detail="invalid X-API-Key")
-    token.last_used_at = now()
-    db.commit()
-    return token.name
+    if not authentication(request):
+        raise HTTPException(status_code=401, detail="Требуется токен доступа")
+    return "admin"
+
+
+class AccessMiddleware:
+    """Protect API/media before reading upload bodies; keep streaming responses streaming."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        path = scope["path"].rstrip("/")
+        protected = path == "/api" or path.startswith("/api/") or path in {"/docs", "/docs/oauth2-redirect", "/redoc", "/openapi.json"}
+
+        async def no_cache(message):
+            if protected and message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers["Cache-Control"] = "no-store"
+                headers["Vary"] = ", ".join(filter(None, [headers.get("Vary"), "Cookie, Authorization, X-API-Key"]))
+            await send(message)
+
+        if protected and path not in {"/api/v1/health", "/api/v1/auth/session"}:
+            request = Request(scope)
+            mode = authentication(request)
+            try:
+                if not mode:
+                    raise HTTPException(status_code=401, detail="Требуется токен доступа")
+                if mode == "cookie" and request.method not in {"GET", "HEAD", "OPTIONS"}:
+                    require_same_origin(request)
+            except HTTPException as exc:
+                return await JSONResponse({"detail": exc.detail}, status_code=exc.status_code)(scope, receive, no_cache)
+        await self.app(scope, receive, no_cache)
