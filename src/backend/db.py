@@ -155,7 +155,8 @@ def init_db() -> None:
         with engine.begin() as conn:
             conn.exec_driver_sql("ALTER TABLE events ADD COLUMN IF NOT EXISTS source VARCHAR(16) NOT NULL DEFAULT 'model'")
     with engine.begin() as conn:  # отклонения без названного правила — не вопрос (activities.review_state)
-        conn.exec_driver_sql("UPDATE events SET review = 'none' WHERE review = 'pending' AND title IS NULL AND source = 'model'")
+        conn.exec_driver_sql("UPDATE events SET review = 'none' WHERE review = 'pending' AND source = 'model' "
+                             "AND (title IS NULL OR event = 'sop_step')")
 
 
 def get_db() -> Iterator[Session]:

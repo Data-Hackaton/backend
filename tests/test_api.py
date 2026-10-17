@@ -191,12 +191,15 @@ def test_events_list_type_ids_and_manual_events(client, mov, s3):
     video_id = client.get(f"/api/v1/queue/jobs/{job_id}").json()["video_id"]
     finish_job(s3, job_id, [violation_event(1.0, job_id=job_id),
                             {"t_start": 0.5, "t_end": 0.5, "event": "person_enter", "status": "expected"},
-                            {"t_start": 0.7, "t_end": 0.7, "event": "put", "status": "warning", "rules": ["out_of_template"]}])
+                            {"t_start": 0.7, "t_end": 0.7, "event": "put", "status": "warning", "rules": ["out_of_template"]},
+                            {"t_start": 0.0, "t_end": 0.9, "event": "sop_step", "status": "warning",
+                             "title": "Пропущен шаг: кассир кладёт купюры в счётную машинку", "rules": ["nvidia_sop_checker"]}])
     types = {t["id"]: t for t in client.get("/api/v1/event-types").json()}
     events = client.get("/api/v1/events").json()
     # в очередь — только названное правило; шаг и отклонение от шаблона без названия — не вопрос
     assert {(e["status"], e["event"]): e["review"] for e in events} == {
-        ("violation", "person_enter"): "pending", ("expected", "person_enter"): "none", ("warning", "put"): "none"}
+        ("violation", "person_enter"): "pending", ("expected", "person_enter"): "none", ("warning", "put"): "none",
+        ("warning", "sop_step"): "none"}
     assert [e["status"] for e in client.get("/api/v1/review").json()] == ["violation"]
     assert {e["type_id"] for e in events} <= set(types)  # у каждого события тип из каталога
     carry = next(e for e in events if e["status"] == "violation")
