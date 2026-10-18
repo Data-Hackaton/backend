@@ -109,10 +109,11 @@ def _store_video(src: Path, video_id: str) -> tuple[dict, str, str | None]:
     """Метаданные, sha256, оригинал и mp4 для плеера в S3."""
     try:
         info = media.probe(src)
+        media.validate_decodable(src)
     except subprocess.TimeoutExpired as e:
-        raise TimeoutError("video probe timed out") from e
+        raise TimeoutError("video validation timed out") from e
     except (ValueError, subprocess.CalledProcessError) as e:
-        raise HTTPException(status_code=422, detail="not a video file") from e
+        raise HTTPException(status_code=422, detail="video cannot be decoded") from e
     sha = media.sha256_file(src)
     source_key = f"videos/{video_id}/source{src.suffix}"
     storage.put_file(source_key, str(src), "video/quicktime" if src.suffix == ".mov" else "video/mp4")

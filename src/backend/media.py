@@ -45,6 +45,19 @@ def probe(path: Path) -> dict:
     }
 
 
+def validate_decodable(path: Path) -> None:
+    """Require an actual decoded frame; container metadata alone is insufficient."""
+    out = subprocess.run(
+        ["ffmpeg", "-v", "error", "-nostdin", "-threads", "1", "-i", str(path),
+         "-map", "0:v:0", "-frames:v", "1", "-vf", "scale=1:1", "-pix_fmt", "gray",
+         "-f", "rawvideo", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=deadlines.remaining(15),
+    )
+    # ffmpeg can exit successfully without producing a frame.
+    if len(out.stdout) != 1:
+        raise ValueError("video contains no decodable frames")
+
+
 def remux_mp4(src: Path, dst: Path) -> None:
     """Тот же H.264 в mp4 с moov в начале — браузер начинает играть сразу и перематывает по Range."""
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(src), "-c", "copy", "-an", "-movflags", "+faststart",
